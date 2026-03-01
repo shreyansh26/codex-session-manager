@@ -25,6 +25,8 @@ describe("buildTurnStartAttempts", () => {
     const serializedInputs = attempts
       .map((attempt) => JSON.stringify(attempt.input))
       .join("\n");
+    expect(serializedInputs).not.toContain("input_text");
+    expect(serializedInputs).not.toContain("input_image");
     expect(serializedInputs).toContain("image");
     expect(serializedInputs).toContain("abc123");
   });

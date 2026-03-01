@@ -73,8 +73,15 @@ export const parseRpcNotification = (
       threadId,
       message: {
         id:
-          pickString(messageRecord, ["id", "messageId", "itemId"]) ??
-          `${threadId}-${role}-${Date.now().toString(36)}-${method.replace("/", "-")}`,
+          pickString(messageRecord, ["id", "messageId", "itemId", "eventId"]) ??
+          fallbackStreamMessageId({
+            threadId,
+            role,
+            eventType: payload.eventType,
+            method,
+            params,
+            record: messageRecord
+          }),
         key: `${deviceId}::${threadId}`,
         threadId,
         deviceId,
@@ -122,6 +129,10 @@ export const parseRpcNotification = (
   if (!payload) {
     return null;
   }
+  const isDeltaMethod = method.toLowerCase().includes("delta");
+  if (isDeltaMethod && payload.eventType !== "reasoning") {
+    return null;
+  }
   const images = extractImageAttachments(item);
 
   const createdAtRaw =
@@ -146,8 +157,15 @@ export const parseRpcNotification = (
     threadId,
     message: {
       id:
-        pickString(item, ["id", "itemId"]) ??
-        `${threadId}-${role}-${Date.now().toString(36)}-${method.replace("/", "-")}`,
+        pickString(item, ["id", "itemId", "eventId"]) ??
+        fallbackStreamMessageId({
+          threadId,
+          role,
+          eventType: payload.eventType,
+          method,
+          params,
+          record: item
+        }),
       key: `${deviceId}::${threadId}`,
       threadId,
       deviceId,
@@ -165,10 +183,12 @@ export const extractItemMessagePayload = (
   method: string,
   role: ChatRole
 ): { content: string; eventType?: ChatMessage["eventType"] } | null => {
-  const content = extractText(item).trim();
+  const rawContent = extractText(item);
+  const preserveRawChunk = shouldPreserveRawChunk(method, role);
+  const content = preserveRawChunk ? rawContent : rawContent.trim();
   const eventType = inferEventType(item, method, role);
 
-  if (content.length > 0) {
+  if (content.trim().length > 0) {
     return {
       content,
       ...(eventType ? { eventType } : {})
@@ -472,6 +492,53 @@ const isActivityMethod = (method: string): boolean => {
 
 const isSyntheticReadMethod = (method: string): boolean =>
   method === "message/read" || method === "item/read";
+
+const shouldPreserveRawChunk = (method: string, role: ChatRole): boolean => {
+  const normalized = method.toLowerCase();
+  return normalized.includes("delta") && role !== "user";
+};
+
+const fallbackStreamMessageId = (params: {
+  threadId: string;
+  role: ChatRole;
+  eventType?: ChatMessage["eventType"];
+  method: string;
+  params: Record<string, unknown> | null;
+  record: Record<string, unknown>;
+}): string => {
+  const turnId = extractTurnId(params.params, params.record);
+  const streamKind =
+    pickString(params.record, ["type", "itemType", "kind", "name"]) ??
+    pickString(asRecord(params.record.item), ["type", "itemType", "kind", "name"]) ??
+    "stream";
+
+  if (turnId) {
+    return [
+      params.threadId,
+      turnId,
+      params.role,
+      params.eventType ?? "message",
+      params.method.replaceAll("/", "-"),
+      streamKind
+    ].join("::");
+  }
+
+  return `${params.threadId}-${params.role}-${Date.now().toString(36)}-${params.method.replace("/", "-")}`;
+};
+
+const extractTurnId = (
+  params: Record<string, unknown> | null,
+  record: Record<string, unknown>
+): string | null => {
+  const paramTurn = asRecord(params?.turn);
+  const recordTurn = asRecord(record.turn);
+  return (
+    pickString(record, ["turnId", "turn_id"]) ??
+    pickString(recordTurn, ["id", "turnId", "turn_id"]) ??
+    pickString(params, ["turnId", "turn_id"]) ??
+    pickString(paramTurn, ["id", "turnId", "turn_id"])
+  );
+};
 
 const normalizeTimestamp = (value: string): string | null => {
   const date = new Date(value);

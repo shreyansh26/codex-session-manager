@@ -279,16 +279,15 @@ const buildTurnInputShapes = (
   const shapes: unknown[] = [];
 
   for (const content of richContentShapes) {
-    shapes.push([{ role: "user", content }]);
-    shapes.push([{ type: "message", role: "user", content }]);
-    shapes.push([{ type: "input_message", role: "user", content }]);
+    // Prefer direct input-item arrays for newer app-server variants.
     shapes.push(content);
+    shapes.push([{ role: "user", content }]);
   }
 
   if (images.length === 0 && prompt.length > 0) {
-    shapes.push([{ role: "user", content: prompt }]);
-    shapes.push([{ type: "input_text", text: prompt }]);
     shapes.push([{ type: "text", text: prompt }]);
+    shapes.push([{ role: "user", content: [{ type: "text", text: prompt }] }]);
+    shapes.push([{ role: "user", content: prompt }]);
     shapes.push([prompt]);
   }
 
@@ -302,10 +301,7 @@ const buildRichContentShapes = (
   const imageShapes = buildImageContentShapes(images);
   const textParts: Array<Record<string, unknown> | null> =
     prompt.length > 0
-      ? [
-          { type: "text", text: prompt },
-          { type: "input_text", text: prompt }
-        ]
+      ? [{ type: "text", text: prompt }]
       : [null];
 
   const contents: unknown[][] = [];
@@ -333,17 +329,17 @@ const buildImageContentShapes = (images: ChatImageAttachment[]): unknown[][] => 
 
   return dedupeByJson([
     images.map((image) => ({
-      type: "image_url",
-      image_url: { url: image.url }
+      type: "image",
+      url: image.url
     })),
     images.map((image) => ({
-      type: "input_image",
+      type: "image",
+      image_url: image.url
+    })),
+    images.map((image) => ({
+      type: "image",
       image_url: { url: image.url }
     })),
-    images.map((image) => ({ type: "input_image", image_url: image.url })),
-    images.map((image) => ({ type: "image_url", image_url: image.url })),
-    images.map((image) => ({ type: "input_image", url: image.url })),
-    images.map((image) => ({ type: "image", image_url: image.url })),
     images
       .map((_, index) => {
         const parsed = dataUrlParsed[index];
@@ -351,18 +347,18 @@ const buildImageContentShapes = (images: ChatImageAttachment[]): unknown[][] => 
           return null;
         }
         return {
-          type: "input_image",
+          type: "image",
           data: parsed.base64,
-          mime_type: parsed.mimeType
+          mimeType: parsed.mimeType
         };
       })
       .filter(
         (
           value
         ): value is {
-          type: "input_image";
+          type: "image";
           data: string;
-          mime_type: string;
+          mimeType: string;
         } => value !== null
       ),
     images
@@ -372,8 +368,8 @@ const buildImageContentShapes = (images: ChatImageAttachment[]): unknown[][] => 
           return null;
         }
         return {
-          type: "input_image",
-          image_base64: parsed.base64,
+          type: "image",
+          data: parsed.base64,
           mime_type: parsed.mimeType
         };
       })
@@ -381,8 +377,8 @@ const buildImageContentShapes = (images: ChatImageAttachment[]): unknown[][] => 
         (
           value
         ): value is {
-          type: "input_image";
-          image_base64: string;
+          type: "image";
+          data: string;
           mime_type: string;
         } => value !== null
       )

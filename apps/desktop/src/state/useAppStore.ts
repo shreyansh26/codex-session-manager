@@ -63,6 +63,8 @@ const POST_SEND_REFRESH_INITIAL_DELAYS_MS = [250, 700, 1_300];
 const PENDING_OPTIMISTIC_RETAIN_MS = 120_000;
 const OPTIMISTIC_ACK_CLOCK_SKEW_MS = 8_000;
 const OPTIMISTIC_ACK_MAX_DELAY_MS = 45_000;
+const SERVER_DUPLICATE_WINDOW_MS = 120_000;
+const REASONING_BUFFER_MAX_WAIT_MS = 8_000;
 
 const pickSelectedSession = (
   preferred: string | null,
@@ -92,26 +94,89 @@ const upsertMessage = (
   incoming: ChatMessage
 ): ChatMessage[] => {
   const existingIndex = existing.findIndex((entry) =>
-    isSameLogicalMessage(entry, incoming)
+    isSameLogicalMessage(entry, incoming) ||
+    isEquivalentServerMessage(entry, incoming)
   );
   if (existingIndex === -1) {
-    return [...existing, incoming].sort(sortMessagesAscending);
+    return dedupeEquivalentServerMessages([...existing, incoming]);
   }
 
   const current = existing[existingIndex];
   const merged: ChatMessage = {
     ...current,
     ...incoming,
-    content:
-      incoming.content.length >= current.content.length
-        ? incoming.content
-        : current.content,
+    content: mergeMessageContent(current, incoming),
     createdAt: pickLatestTimestamp(current.createdAt, incoming.createdAt)
   };
 
   const next = [...existing];
   next[existingIndex] = merged;
-  return next.sort(sortMessagesAscending);
+  return dedupeEquivalentServerMessages(next);
+};
+
+const isStreamingMergeCandidate = (
+  current: ChatMessage,
+  incoming: ChatMessage
+): boolean =>
+  current.role !== "user" &&
+  incoming.role !== "user" &&
+  (current.eventType === "reasoning" ||
+    incoming.eventType === "reasoning" ||
+    current.role === "system" ||
+    incoming.role === "system");
+
+const appendStreamingChunk = (
+  currentContent: string,
+  incomingContent: string
+): string => {
+  if (incomingContent.length === 0) {
+    return currentContent;
+  }
+  if (currentContent.length === 0) {
+    return incomingContent;
+  }
+  if (
+    currentContent === incomingContent ||
+    currentContent.endsWith(incomingContent) ||
+    incomingContent.startsWith(currentContent)
+  ) {
+    return incomingContent.length >= currentContent.length
+      ? incomingContent
+      : currentContent;
+  }
+
+  return `${currentContent}${incomingContent}`;
+};
+
+const mergeMessageContent = (
+  current: ChatMessage,
+  incoming: ChatMessage
+): string => {
+  const currentContent = current.content;
+  const incomingContent = incoming.content;
+  if (incomingContent.length === 0) {
+    return currentContent;
+  }
+  if (currentContent.length === 0) {
+    return incomingContent;
+  }
+  if (incomingContent === currentContent) {
+    return incomingContent;
+  }
+  if (incomingContent.startsWith(currentContent)) {
+    return incomingContent;
+  }
+  if (currentContent.startsWith(incomingContent)) {
+    return currentContent;
+  }
+
+  if (isStreamingMergeCandidate(current, incoming)) {
+    return appendStreamingChunk(currentContent, incomingContent);
+  }
+
+  return incomingContent.length >= currentContent.length
+    ? incomingContent
+    : currentContent;
 };
 
 const normalizeMessageText = (value: string): string =>
@@ -142,6 +207,15 @@ const isLikelyOptimisticAcknowledgement = (
   );
 };
 
+const areServerTimestampsClose = (aIso: string, bIso: string): boolean => {
+  const aMs = Date.parse(aIso);
+  const bMs = Date.parse(bIso);
+  if (Number.isNaN(aMs) || Number.isNaN(bMs)) {
+    return false;
+  }
+  return Math.abs(aMs - bMs) <= SERVER_DUPLICATE_WINDOW_MS;
+};
+
 const hasAcknowledgedEquivalent = (
   optimistic: ChatMessage,
   incoming: ChatMessage
@@ -163,6 +237,36 @@ const hasAcknowledgedEquivalent = (
   return isLikelyOptimisticAcknowledgement(optimistic.createdAt, incoming.createdAt);
 };
 
+const isEquivalentServerMessage = (
+  current: ChatMessage,
+  incoming: ChatMessage
+): boolean => {
+  if (isOptimisticMessage(current) || isOptimisticMessage(incoming)) {
+    return false;
+  }
+
+  const sameContent =
+    normalizeMessageText(current.content) === normalizeMessageText(incoming.content);
+  const sameImages = imageSignature(current) === imageSignature(incoming);
+  if (!sameContent || !sameImages) {
+    return false;
+  }
+
+  const sameRoleAndType =
+    current.role === incoming.role &&
+    (current.eventType ?? "") === (incoming.eventType ?? "");
+  if (sameRoleAndType) {
+    return areServerTimestampsClose(current.createdAt, incoming.createdAt);
+  }
+
+  const assistantReasoningDuplicate =
+    ((current.eventType === "reasoning" && incoming.role === "assistant") ||
+      (incoming.eventType === "reasoning" && current.role === "assistant")) &&
+    areServerTimestampsClose(current.createdAt, incoming.createdAt);
+
+  return assistantReasoningDuplicate;
+};
+
 const isSameLogicalMessage = (
   current: ChatMessage,
   incoming: ChatMessage
@@ -181,6 +285,16 @@ const isSameLogicalMessage = (
 
   const currentMs = Date.parse(current.createdAt);
   const incomingMs = Date.parse(incoming.createdAt);
+  const streamingCandidate = isStreamingMergeCandidate(current, incoming);
+  if (streamingCandidate) {
+    if (Number.isNaN(currentMs) || Number.isNaN(incomingMs)) {
+      return true;
+    }
+    if (Math.abs(currentMs - incomingMs) <= STREAMING_MERGE_WINDOW_MS * 2) {
+      return true;
+    }
+  }
+
   if (Number.isNaN(currentMs) || Number.isNaN(incomingMs)) {
     return false;
   }
@@ -233,6 +347,44 @@ const sortMessagesAscending = (a: ChatMessage, b: ChatMessage): number => {
   return aMs - bMs;
 };
 
+const preferCanonicalMessage = (
+  current: ChatMessage,
+  incoming: ChatMessage
+): ChatMessage => {
+  const currentReasoning = current.eventType === "reasoning";
+  const incomingReasoning = incoming.eventType === "reasoning";
+  if (currentReasoning !== incomingReasoning) {
+    return incomingReasoning ? current : incoming;
+  }
+
+  const currentImages = current.images?.length ?? 0;
+  const incomingImages = incoming.images?.length ?? 0;
+  if (incomingImages !== currentImages) {
+    return incomingImages > currentImages ? incoming : current;
+  }
+
+  return pickLatestTimestamp(current.createdAt, incoming.createdAt) === incoming.createdAt
+    ? incoming
+    : current;
+};
+
+const dedupeEquivalentServerMessages = (
+  messages: ChatMessage[]
+): ChatMessage[] => {
+  const deduped: ChatMessage[] = [];
+  for (const message of messages) {
+    const existingIndex = deduped.findIndex((entry) =>
+      isEquivalentServerMessage(entry, message)
+    );
+    if (existingIndex === -1) {
+      deduped.push(message);
+      continue;
+    }
+    deduped[existingIndex] = preferCanonicalMessage(deduped[existingIndex], message);
+  }
+  return deduped.sort(sortMessagesAscending);
+};
+
 const mergeThreadMessages = (
   existing: ChatMessage[],
   incoming: ChatMessage[]
@@ -244,7 +396,8 @@ const mergeThreadMessages = (
     const alreadyPresent = merged.some(
       (entry) =>
         isSameLogicalMessage(entry, message) ||
-        hasAcknowledgedEquivalent(message, entry)
+        hasAcknowledgedEquivalent(message, entry) ||
+        isEquivalentServerMessage(entry, message)
     );
     if (alreadyPresent) {
       continue;
@@ -265,7 +418,7 @@ const mergeThreadMessages = (
     merged = upsertMessage(merged, message);
   }
 
-  return merged.sort(sortMessagesAscending);
+  return dedupeEquivalentServerMessages(merged);
 };
 
 const normalizeSubmissionImages = (
@@ -336,6 +489,15 @@ const pickString = (
 export const useAppStore = create<AppStore>((set, get) => {
   const notificationRefreshAtMs = new Map<string, number>();
   const postSendRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const reasoningBuffers = new Map<
+    string,
+    {
+      message: ChatMessage;
+      chunks: string[];
+      startedAtMs: number;
+      timer: ReturnType<typeof setTimeout> | null;
+    }
+  >();
 
   const stopPostSendRefresh = (sessionKey: string): void => {
     const pendingTimer = postSendRefreshTimers.get(sessionKey);
@@ -351,6 +513,127 @@ export const useAppStore = create<AppStore>((set, get) => {
       if (sessionKey.startsWith(prefix)) {
         stopPostSendRefresh(sessionKey);
       }
+    }
+  };
+
+  const stopReasoningBufferTimer = (bufferKey: string): void => {
+    const pending = reasoningBuffers.get(bufferKey);
+    if (!pending || pending.timer === null) {
+      return;
+    }
+    clearTimeout(pending.timer);
+    pending.timer = null;
+  };
+
+  const flushReasoningBuffer = (bufferKey: string): void => {
+    const pending = reasoningBuffers.get(bufferKey);
+    if (!pending) {
+      return;
+    }
+    stopReasoningBufferTimer(bufferKey);
+    reasoningBuffers.delete(bufferKey);
+
+    const mergedContent = pending.chunks.join("").trim();
+    const message: ChatMessage = {
+      ...pending.message,
+      content: mergedContent.length > 0 ? mergedContent : pending.message.content
+    };
+
+    const sessionKey = message.key;
+    set((state) => {
+      const current = state.messagesBySession[sessionKey] ?? [];
+      const next = upsertMessage(current, message);
+      return {
+        messagesBySession: {
+          ...state.messagesBySession,
+          [sessionKey]: next
+        }
+      };
+    });
+  };
+
+  const queueReasoningBuffer = (
+    sessionKey: string,
+    message: ChatMessage,
+    method: string
+  ): void => {
+    const bufferKey = `${sessionKey}::${message.id}`;
+    const nowMs = Date.now();
+    const existing = reasoningBuffers.get(bufferKey);
+    const pending =
+      existing ??
+      {
+        message: { ...message, content: "" },
+        chunks: [],
+        startedAtMs: nowMs,
+        timer: null
+      };
+
+    pending.message = { ...pending.message, ...message, content: pending.message.content };
+    if (message.content.length > 0) {
+      pending.chunks.push(message.content);
+    }
+    reasoningBuffers.set(bufferKey, pending);
+
+    const isFinal =
+      method.includes("completed") ||
+      method.includes("done") ||
+      method.includes("final");
+    if (isFinal || nowMs - pending.startedAtMs >= REASONING_BUFFER_MAX_WAIT_MS) {
+      flushReasoningBuffer(bufferKey);
+      return;
+    }
+
+    if (pending.timer === null) {
+      pending.timer = setTimeout(() => {
+        flushReasoningBuffer(bufferKey);
+      }, REASONING_BUFFER_MAX_WAIT_MS);
+    }
+  };
+
+  const clearReasoningBuffersForDevice = (deviceId: string): void => {
+    const prefix = `${deviceId}::`;
+    for (const key of reasoningBuffers.keys()) {
+      if (!key.startsWith(prefix)) {
+        continue;
+      }
+      stopReasoningBufferTimer(key);
+      reasoningBuffers.delete(key);
+    }
+  };
+
+  const dropEquivalentReasoningBuffers = (
+    sessionKey: string,
+    assistantMessage: ChatMessage
+  ): void => {
+    const normalizedAssistant = normalizeMessageText(assistantMessage.content);
+    if (normalizedAssistant.length === 0) {
+      return;
+    }
+
+    for (const [key, pending] of reasoningBuffers.entries()) {
+      if (!key.startsWith(`${sessionKey}::`)) {
+        continue;
+      }
+      if (pending.message.eventType !== "reasoning") {
+        continue;
+      }
+
+      const bufferedText = normalizeMessageText(pending.chunks.join(""));
+      if (bufferedText.length === 0) {
+        continue;
+      }
+
+      const equivalentText =
+        bufferedText === normalizedAssistant ||
+        bufferedText.startsWith(normalizedAssistant) ||
+        normalizedAssistant.startsWith(bufferedText);
+      if (!equivalentText) {
+        continue;
+      }
+
+      stopReasoningBufferTimer(key);
+      reasoningBuffers.delete(key);
     }
   };
 
@@ -423,6 +706,7 @@ export const useAppStore = create<AppStore>((set, get) => {
   };
 
   const applyNotification = (deviceId: string, notification: RpcNotification): void => {
+    const method = notification.method.replaceAll(".", "/").toLowerCase();
     const parsed = parseRpcNotification(deviceId, notification);
     if (!parsed) {
       refreshThreadFromNotification(deviceId, notification);
@@ -430,6 +714,19 @@ export const useAppStore = create<AppStore>((set, get) => {
     }
 
     const sessionKey = makeSessionKey(deviceId, parsed.threadId);
+
+    if (
+      parsed.message.eventType === "reasoning" &&
+      parsed.message.role !== "user"
+    ) {
+      queueReasoningBuffer(sessionKey, parsed.message, method);
+      refreshThreadFromNotification(deviceId, notification);
+      return;
+    }
+
+    if (parsed.message.role === "assistant") {
+      dropEquivalentReasoningBuffers(sessionKey, parsed.message);
+    }
 
     set((state) => {
       const current = state.messagesBySession[sessionKey] ?? [];
@@ -784,6 +1081,7 @@ export const useAppStore = create<AppStore>((set, get) => {
     disconnect: async (deviceId) => {
       try {
         stopPostSendRefreshesForDevice(deviceId);
+        clearReasoningBuffersForDevice(deviceId);
         const disconnected = await disconnectDevice(deviceId);
         closeDeviceClient(deviceId);
         set((state) => ({
@@ -796,6 +1094,7 @@ export const useAppStore = create<AppStore>((set, get) => {
     remove: async (deviceId) => {
       try {
         stopPostSendRefreshesForDevice(deviceId);
+        clearReasoningBuffersForDevice(deviceId);
         const devices = await removeDevice(deviceId);
         closeDeviceClient(deviceId);
         set((state) => {

@@ -93,6 +93,57 @@ describe("parseRpcNotification", () => {
     });
   });
 
+  it("uses a stable id for delta-style stream updates within the same turn", () => {
+    const first = parseRpcNotification("device-6", {
+      method: "item/delta",
+      params: {
+        threadId: "thread-stream",
+        turnId: "turn-1",
+        item: {
+          role: "system",
+          type: "reasoning",
+          delta: "Hel"
+        }
+      }
+    });
+
+    const second = parseRpcNotification("device-6", {
+      method: "item/delta",
+      params: {
+        threadId: "thread-stream",
+        turnId: "turn-1",
+        item: {
+          role: "system",
+          type: "reasoning",
+          delta: "lo"
+        }
+      }
+    });
+
+    expect(first?.kind).toBe("message");
+    expect(second?.kind).toBe("message");
+    expect(first?.message.id).toBe(second?.message.id);
+    expect(first?.message.eventType).toBe("reasoning");
+    expect(second?.message.eventType).toBe("reasoning");
+  });
+
+  it("ignores non-reasoning assistant delta chunks to avoid duplicate final responses", () => {
+    const parsed = parseRpcNotification("device-7", {
+      method: "item/delta",
+      params: {
+        threadId: "thread-assistant-delta",
+        turnId: "turn-2",
+        item: {
+          role: "assistant",
+          type: "assistant_message",
+          delta: "partial assistant output"
+        }
+      }
+    });
+
+    expect(parsed).toBeNull();
+  });
+
   it("does not misclassify message status payload as turn event", () => {
     const parsed = parseRpcNotification("device-4", {
       method: "message/completed",
