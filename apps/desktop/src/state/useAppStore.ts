@@ -2,7 +2,6 @@ import { create } from "zustand";
 import { makeSessionKey } from "../domain/sessionKey";
 import type {
   ChatMessage,
-  DeviceAddLocalRequest,
   DeviceAddSshRequest,
   DeviceRecord,
   RpcNotification,
@@ -49,7 +48,6 @@ interface AppStore {
     options?: { preserveSummary?: boolean; skipMessages?: boolean }
   ) => Promise<void>;
   submitComposer: (prompt: string) => Promise<void>;
-  addLocal: (request: DeviceAddLocalRequest) => Promise<void>;
   addSsh: (request: DeviceAddSshRequest) => Promise<void>;
   connect: (deviceId: string) => Promise<void>;
   disconnect: (deviceId: string) => Promise<void>;
@@ -207,17 +205,17 @@ export const useAppStore = create<AppStore>((set, get) => {
           devices = await listDevices();
         }
 
-        if (devices.length === 0) {
-          const localDevice = await addLocalDevice({ name: fallbackLocalName });
-          devices = [localDevice];
+        let localDevice = findLocalDevice(devices);
+        if (!localDevice) {
+          localDevice = await addLocalDevice({ name: fallbackLocalName });
+          devices = upsertDevice(devices, localDevice);
         }
 
-        const localDevice = findLocalDevice(devices);
         if (localDevice && !localDevice.connected) {
           try {
             const connectedLocal = await connectDevice(localDevice.id);
-            await ensureDeviceConnected(connectedLocal);
             devices = upsertDevice(devices, connectedLocal);
+            localDevice = connectedLocal;
           } catch (error) {
             const message = toErrorMessage(error);
             devices = upsertDevice(devices, {
@@ -489,26 +487,6 @@ export const useAppStore = create<AppStore>((set, get) => {
         }
       })();
     },
-    addLocal: async (request) => {
-      try {
-        const existingLocal = findLocalDevice(get().devices);
-        if (existingLocal) {
-          if (!existingLocal.connected) {
-            await get().connect(existingLocal.id);
-          } else {
-            await get().refreshDeviceSessions(existingLocal.id);
-          }
-          set({ globalError: null });
-          return;
-        }
-
-        const device = await addLocalDevice(request);
-        set((state) => ({ devices: upsertDevice(state.devices, device) }));
-        await get().connect(device.id);
-      } catch (error) {
-        set({ globalError: toErrorMessage(error) });
-      }
-    },
     addSsh: async (request) => {
       try {
         const device = await addSshDevice(request);
@@ -592,5 +570,43 @@ export const shutdownRpcClients = (): void => {
   closeAllClients();
 };
 
-const toErrorMessage = (error: unknown): string =>
-  error instanceof Error ? error.message : "Unknown error";
+const toErrorMessage = (error: unknown): string => {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  if (typeof error === "string" && error.trim().length > 0) {
+    return error;
+  }
+
+  if (typeof error === "object" && error !== null) {
+    const record = error as Record<string, unknown>;
+    const directMessage = record.message;
+    if (typeof directMessage === "string" && directMessage.trim().length > 0) {
+      return directMessage;
+    }
+
+    const cause = record.cause;
+    if (typeof cause === "string" && cause.trim().length > 0) {
+      return cause;
+    }
+    if (typeof cause === "object" && cause !== null) {
+      const causeRecord = cause as Record<string, unknown>;
+      const nestedMessage = causeRecord.message;
+      if (typeof nestedMessage === "string" && nestedMessage.trim().length > 0) {
+        return nestedMessage;
+      }
+    }
+
+    try {
+      const serialized = JSON.stringify(record);
+      if (serialized && serialized !== "{}") {
+        return serialized;
+      }
+    } catch {
+      // Ignore serialization errors and use fallback below.
+    }
+  }
+
+  return "Unknown error";
+};

@@ -31,7 +31,6 @@ export default function App() {
   const clearError = useAppStore((state) => state.clearError);
   const selectSession = useAppStore((state) => state.selectSession);
   const submitComposer = useAppStore((state) => state.submitComposer);
-  const addLocal = useAppStore((state) => state.addLocal);
   const addSsh = useAppStore((state) => state.addSsh);
   const connect = useAppStore((state) => state.connect);
   const disconnect = useAppStore((state) => state.disconnect);
@@ -117,9 +116,6 @@ export default function App() {
           loading={loading}
           onSelectSession={(sessionKey) => {
             void selectSession(sessionKey);
-          }}
-          onAddLocal={(request) => {
-            void addLocal(request);
           }}
           onAddSsh={(request) => {
             void addSsh(request);

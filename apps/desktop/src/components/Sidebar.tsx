@@ -1,6 +1,5 @@
 import { useMemo, useState } from "react";
 import type {
-  DeviceAddLocalRequest,
   DeviceAddSshRequest,
   DeviceRecord,
   SessionSummary
@@ -16,7 +15,6 @@ interface SidebarProps {
   onDisconnect: (deviceId: string) => void;
   onRemove: (deviceId: string) => void;
   onRefreshDevice: (deviceId: string) => void;
-  onAddLocal: (request: DeviceAddLocalRequest) => void;
   onAddSsh: (request: DeviceAddSshRequest) => void;
 }
 
@@ -107,10 +105,8 @@ export default function Sidebar({
   onDisconnect,
   onRemove,
   onRefreshDevice,
-  onAddLocal,
   onAddSsh
 }: SidebarProps) {
-  const [localName, setLocalName] = useState("Local Device");
   const [sshName, setSshName] = useState("");
   const [sshHost, setSshHost] = useState("");
   const [sshUser, setSshUser] = useState("");
@@ -120,10 +116,6 @@ export default function Sidebar({
   const [sshCodexBin, setSshCodexBin] = useState("");
   const [identityFile, setIdentityFile] = useState("");
   const [collapsedByDevice, setCollapsedByDevice] = useState<Record<string, boolean>>({});
-  const hasLocalDevice = useMemo(
-    () => devices.some((device) => device.config.kind === "local"),
-    [devices]
-  );
 
   const sessionsByDevice = useMemo(() => {
     const grouped = new Map<string, SessionSummary[]>();
@@ -148,31 +140,6 @@ export default function Sidebar({
       </header>
 
       <section className="sidebar__new-device">
-        <details>
-          <summary>Add local device</summary>
-          <form
-            className="sidebar__new-device-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              onAddLocal({ name: localName.trim() || "Local Device" });
-            }}
-          >
-            <input
-              value={localName}
-              onChange={(event) => setLocalName(event.target.value)}
-              placeholder="Local display name"
-            />
-            <button type="submit" disabled={loading || hasLocalDevice}>
-              Add local
-            </button>
-            {hasLocalDevice ? (
-              <p className="sidebar__local-note">
-                Local device already configured. Use Connect/Refresh below.
-              </p>
-            ) : null}
-          </form>
-        </details>
-
         <details>
           <summary>Add SSH device</summary>
           <form
