@@ -245,12 +245,13 @@ export const startTurn = async (
   return turnId;
 };
 
-const buildTurnStartAttempts = (
+export const buildTurnStartAttempts = (
   threadId: string,
   submission: ComposerSubmission
 ): Array<Record<string, unknown>> => {
   const normalizedPrompt = submission.prompt.trim();
   const normalizedImages = normalizeOutgoingImages(submission.images);
+  const hasImages = normalizedImages.length > 0;
 
   const sequenceShapes = buildTurnInputShapes(normalizedPrompt, normalizedImages);
 
@@ -261,7 +262,7 @@ const buildTurnStartAttempts = (
   }
 
   // Keep legacy fallbacks for older app-server variants.
-  if (normalizedPrompt.length > 0) {
+  if (!hasImages && normalizedPrompt.length > 0) {
     attempts.push({ threadId, input: normalizedPrompt });
     attempts.push({ thread_id: threadId, input: normalizedPrompt });
     attempts.push({ input: normalizedPrompt });
@@ -279,10 +280,12 @@ const buildTurnInputShapes = (
 
   for (const content of richContentShapes) {
     shapes.push([{ role: "user", content }]);
+    shapes.push([{ type: "message", role: "user", content }]);
+    shapes.push([{ type: "input_message", role: "user", content }]);
     shapes.push(content);
   }
 
-  if (prompt.length > 0) {
+  if (images.length === 0 && prompt.length > 0) {
     shapes.push([{ role: "user", content: prompt }]);
     shapes.push([{ type: "input_text", text: prompt }]);
     shapes.push([{ type: "text", text: prompt }]);
@@ -326,7 +329,9 @@ const buildImageContentShapes = (images: ChatImageAttachment[]): unknown[][] => 
     return [[]];
   }
 
-  return [
+  const dataUrlParsed = images.map((image) => parseDataUrlImage(image.url));
+
+  return dedupeByJson([
     images.map((image) => ({
       type: "image_url",
       image_url: { url: image.url }
@@ -336,8 +341,52 @@ const buildImageContentShapes = (images: ChatImageAttachment[]): unknown[][] => 
       image_url: { url: image.url }
     })),
     images.map((image) => ({ type: "input_image", image_url: image.url })),
-    images.map((image) => ({ type: "image_url", image_url: image.url }))
-  ];
+    images.map((image) => ({ type: "image_url", image_url: image.url })),
+    images.map((image) => ({ type: "input_image", url: image.url })),
+    images.map((image) => ({ type: "image", image_url: image.url })),
+    images
+      .map((_, index) => {
+        const parsed = dataUrlParsed[index];
+        if (!parsed) {
+          return null;
+        }
+        return {
+          type: "input_image",
+          data: parsed.base64,
+          mime_type: parsed.mimeType
+        };
+      })
+      .filter(
+        (
+          value
+        ): value is {
+          type: "input_image";
+          data: string;
+          mime_type: string;
+        } => value !== null
+      ),
+    images
+      .map((_, index) => {
+        const parsed = dataUrlParsed[index];
+        if (!parsed) {
+          return null;
+        }
+        return {
+          type: "input_image",
+          image_base64: parsed.base64,
+          mime_type: parsed.mimeType
+        };
+      })
+      .filter(
+        (
+          value
+        ): value is {
+          type: "input_image";
+          image_base64: string;
+          mime_type: string;
+        } => value !== null
+      )
+  ]);
 };
 
 const normalizeOutgoingImages = (
@@ -354,6 +403,22 @@ const isSupportedOutgoingImageUrl = (value: string): boolean => {
     normalized.startsWith("https://") ||
     normalized.startsWith("http://")
   );
+};
+
+const parseDataUrlImage = (
+  value: string
+): { mimeType: string; base64: string } | null => {
+  const trimmed = value.trim();
+  const match = trimmed.match(/^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i);
+  if (!match) {
+    return null;
+  }
+  const mimeType = match[1].toLowerCase();
+  const base64 = match[2];
+  if (base64.length === 0) {
+    return null;
+  }
+  return { mimeType, base64 };
 };
 
 const dedupeByJson = <T>(values: T[]): T[] => {
@@ -430,8 +495,10 @@ const parseMessagesFromThread = (
     return [];
   }
 
+  const threadFallbackCreatedAt = pickTimestampIso(thread) ?? new Date().toISOString();
+
   const fromMessages = ensureArray(thread.messages).flatMap((entry) =>
-    parseMessageLike(deviceId, threadId, entry)
+    parseMessageLike(deviceId, threadId, entry, threadFallbackCreatedAt)
   );
 
   const turns = ensureArray(thread.turns);
@@ -440,10 +507,10 @@ const parseMessagesFromThread = (
     const turnCreatedAt =
       normalizeIso(
         pickString(turnRecord, ["createdAt", "created_at", "startedAt", "started_at"])
-      ) ?? new Date().toISOString();
+      ) ?? threadFallbackCreatedAt;
 
     const messages = ensureArray(turnRecord?.messages).flatMap((entry) =>
-      parseMessageLike(deviceId, threadId, entry)
+      parseMessageLike(deviceId, threadId, entry, turnCreatedAt)
     );
 
     const items = ensureArray(turnRecord?.items).flatMap((item) =>
@@ -456,55 +523,40 @@ const parseMessagesFromThread = (
   const combined = [...fromMessages, ...fromTurns];
   const deduped = new Map<string, ChatMessage>();
   for (const message of combined) {
-    const key = messageIdentityKey(message);
-    const current = deduped.get(key);
-    deduped.set(key, current ? mergeMessages(current, message) : message);
+    const key = strictMessageIdentityKey(message);
+    if (!deduped.has(key)) {
+      deduped.set(key, message);
+    }
   }
 
   return [...deduped.values()].sort(sortMessagesAscending);
 };
 
-const messageIdentityKey = (message: ChatMessage): string => {
+const strictMessageIdentityKey = (message: ChatMessage): string => {
   const normalizedTimestamp = normalizeIso(message.createdAt) ?? message.createdAt;
+  const normalizedContent = message.content.replace(/\s+/g, " ").trim();
+  const imageSignature = (message.images ?? [])
+    .map((image) => image.url.trim())
+    .filter((url) => url.length > 0)
+    .join("|");
   return [
     message.id,
     message.role,
     message.eventType ?? "",
-    normalizedTimestamp
+    normalizedTimestamp,
+    normalizedContent,
+    imageSignature
   ].join("::");
-};
-
-const mergeMessages = (current: ChatMessage, incoming: ChatMessage): ChatMessage => {
-  const content =
-    incoming.content.length >= current.content.length ? incoming.content : current.content;
-  const createdAt = pickLatestTimestamp(current.createdAt, incoming.createdAt);
-
-  return {
-    ...current,
-    ...incoming,
-    content,
-    createdAt
-  };
-};
-
-const pickLatestTimestamp = (a: string, b: string): string => {
-  const aMs = Date.parse(a);
-  const bMs = Date.parse(b);
-
-  if (Number.isNaN(aMs)) {
-    return b;
-  }
-  if (Number.isNaN(bMs)) {
-    return a;
-  }
-  return bMs >= aMs ? b : a;
 };
 
 const sortMessagesAscending = (a: ChatMessage, b: ChatMessage): number => {
   const aMs = parseTimestampMs(a.createdAt);
   const bMs = parseTimestampMs(b.createdAt);
+  if (aMs === -1 && bMs === -1) {
+    return 0;
+  }
   if (aMs === bMs) {
-    return a.id.localeCompare(b.id);
+    return 0;
   }
   return aMs - bMs;
 };
@@ -512,7 +564,8 @@ const sortMessagesAscending = (a: ChatMessage, b: ChatMessage): number => {
 const parseMessageLike = (
   deviceId: string,
   threadId: string,
-  value: unknown
+  value: unknown,
+  fallbackCreatedAt: string
 ): ChatMessage[] => {
   const record = asRecord(value);
   if (!record) {
@@ -527,7 +580,7 @@ const parseMessageLike = (
   const images = extractImageAttachments(record);
   const createdAt =
     normalizeIso(pickString(record, ["createdAt", "created_at", "completedAt"])) ??
-    new Date().toISOString();
+    fallbackCreatedAt;
 
   const id =
     pickString(record, ["id", "messageId", "itemId"]) ??

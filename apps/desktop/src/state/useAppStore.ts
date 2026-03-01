@@ -61,7 +61,8 @@ const POST_SEND_REFRESH_BURST_MS = 45_000;
 const POST_SEND_REFRESH_INTERVAL_MS = 1_200;
 const POST_SEND_REFRESH_INITIAL_DELAYS_MS = [250, 700, 1_300];
 const PENDING_OPTIMISTIC_RETAIN_MS = 120_000;
-const RECENT_SERVER_MESSAGE_RETAIN_MS = 45_000;
+const OPTIMISTIC_ACK_CLOCK_SKEW_MS = 8_000;
+const OPTIMISTIC_ACK_MAX_DELAY_MS = 45_000;
 
 const pickSelectedSession = (
   preferred: string | null,
@@ -125,17 +126,20 @@ const imageSignature = (message: ChatMessage): string =>
     .filter((url) => url.length > 0)
     .join("|");
 
-const timestampsCloseEnough = (
-  aIso: string,
-  bIso: string,
-  thresholdMs: number
+const isLikelyOptimisticAcknowledgement = (
+  optimisticIso: string,
+  incomingIso: string
 ): boolean => {
-  const aMs = Date.parse(aIso);
-  const bMs = Date.parse(bIso);
-  if (Number.isNaN(aMs) || Number.isNaN(bMs)) {
-    return true;
+  const optimisticMs = Date.parse(optimisticIso);
+  const incomingMs = Date.parse(incomingIso);
+  if (Number.isNaN(optimisticMs) || Number.isNaN(incomingMs)) {
+    return false;
   }
-  return Math.abs(aMs - bMs) <= thresholdMs;
+
+  return (
+    incomingMs >= optimisticMs - OPTIMISTIC_ACK_CLOCK_SKEW_MS &&
+    incomingMs <= optimisticMs + OPTIMISTIC_ACK_MAX_DELAY_MS
+  );
 };
 
 const hasAcknowledgedEquivalent = (
@@ -156,7 +160,7 @@ const hasAcknowledgedEquivalent = (
     return false;
   }
 
-  return timestampsCloseEnough(optimistic.createdAt, incoming.createdAt, 120_000);
+  return isLikelyOptimisticAcknowledgement(optimistic.createdAt, incoming.createdAt);
 };
 
 const isSameLogicalMessage = (
@@ -215,7 +219,7 @@ const sortMessagesAscending = (a: ChatMessage, b: ChatMessage): number => {
   const aMs = Date.parse(a.createdAt);
   const bMs = Date.parse(b.createdAt);
   if (Number.isNaN(aMs) && Number.isNaN(bMs)) {
-    return a.id.localeCompare(b.id);
+    return 0;
   }
   if (Number.isNaN(aMs)) {
     return 1;
@@ -224,7 +228,7 @@ const sortMessagesAscending = (a: ChatMessage, b: ChatMessage): number => {
     return -1;
   }
   if (aMs === bMs) {
-    return a.id.localeCompare(b.id);
+    return 0;
   }
   return aMs - bMs;
 };
@@ -252,10 +256,9 @@ const mergeThreadMessages = (
       isOptimisticMessage(message) &&
       message.role === "user" &&
       ageMs <= PENDING_OPTIMISTIC_RETAIN_MS;
-    const keepRecentServerMessage =
-      !isOptimisticMessage(message) && ageMs <= RECENT_SERVER_MESSAGE_RETAIN_MS;
+    const keepServerMessage = !isOptimisticMessage(message);
 
-    if (!keepOptimisticPending && !keepRecentServerMessage) {
+    if (!keepOptimisticPending && !keepServerMessage) {
       continue;
     }
 
