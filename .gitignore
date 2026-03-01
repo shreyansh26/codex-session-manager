@@ -1,0 +1,12 @@
+.DS_Store
+
+# JavaScript artifacts
+apps/desktop/node_modules/
+apps/desktop/dist/
+apps/desktop/coverage/
+
+# Rust artifacts
+target/
+
+CONTINUITY.md
+.agent
