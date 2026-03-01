@@ -1,6 +1,5 @@
 export type DeviceKind = "local" | "ssh";
 export type ChatRole = "user" | "assistant" | "system" | "tool";
-export type TurnStatus = "idle" | "running" | "completed" | "failed";
 
 export interface DeviceConnection {
   endpoint: string;
@@ -63,6 +62,20 @@ export interface ChatMessage {
   role: ChatRole;
   content: string;
   createdAt: string;
+  images?: ChatImageAttachment[];
+}
+
+export interface ChatImageAttachment {
+  id: string;
+  url: string;
+  mimeType?: string;
+  fileName?: string;
+  sizeBytes?: number;
+}
+
+export interface ComposerSubmission {
+  prompt: string;
+  images: ChatImageAttachment[];
 }
 
 export interface ThreadPayload {

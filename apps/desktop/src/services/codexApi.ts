@@ -1,13 +1,15 @@
 import { makeSessionKey } from "../domain/sessionKey";
 import type {
+  ChatImageAttachment,
   ChatMessage,
   ChatRole,
+  ComposerSubmission,
   DeviceRecord,
   RpcNotification,
   SessionSummary,
   ThreadPayload
 } from "../domain/types";
-import { extractItemMessagePayload } from "./eventParser";
+import { extractImageAttachments, extractItemMessagePayload } from "./eventParser";
 import { JsonRpcClient } from "./jsonRpcClient";
 
 type ClientState = {
@@ -229,10 +231,14 @@ export const resumeThread = async (
 export const startTurn = async (
   device: DeviceRecord,
   threadId: string,
-  prompt: string
+  submission: ComposerSubmission
 ): Promise<string | null> => {
   const client = await ensureInitialized(device);
-  const result = await callWithFallback(client, "turn/start", buildTurnStartAttempts(threadId, prompt));
+  const result = await callWithFallback(
+    client,
+    "turn/start",
+    buildTurnStartAttempts(threadId, submission)
+  );
 
   const record = asRecord(result);
   const turnId = pickString(record, ["turnId", "id"]);
@@ -241,17 +247,12 @@ export const startTurn = async (
 
 const buildTurnStartAttempts = (
   threadId: string,
-  prompt: string
+  submission: ComposerSubmission
 ): Array<Record<string, unknown>> => {
-  const normalizedPrompt = prompt.trim();
-  const sequenceShapes: unknown[] = [
-    [{ role: "user", content: [{ type: "input_text", text: normalizedPrompt }] }],
-    [{ role: "user", content: [{ type: "text", text: normalizedPrompt }] }],
-    [{ role: "user", content: normalizedPrompt }],
-    [{ type: "input_text", text: normalizedPrompt }],
-    [{ type: "text", text: normalizedPrompt }],
-    [normalizedPrompt]
-  ];
+  const normalizedPrompt = submission.prompt.trim();
+  const normalizedImages = normalizeOutgoingImages(submission.images);
+
+  const sequenceShapes = buildTurnInputShapes(normalizedPrompt, normalizedImages);
 
   const attempts: Array<Record<string, unknown>> = [];
   for (const input of sequenceShapes) {
@@ -260,11 +261,113 @@ const buildTurnStartAttempts = (
   }
 
   // Keep legacy fallbacks for older app-server variants.
-  attempts.push({ threadId, input: normalizedPrompt });
-  attempts.push({ thread_id: threadId, input: normalizedPrompt });
-  attempts.push({ input: normalizedPrompt });
+  if (normalizedPrompt.length > 0) {
+    attempts.push({ threadId, input: normalizedPrompt });
+    attempts.push({ thread_id: threadId, input: normalizedPrompt });
+    attempts.push({ input: normalizedPrompt });
+  }
 
   return attempts;
+};
+
+const buildTurnInputShapes = (
+  prompt: string,
+  images: ChatImageAttachment[]
+): unknown[] => {
+  const richContentShapes = buildRichContentShapes(prompt, images);
+  const shapes: unknown[] = [];
+
+  for (const content of richContentShapes) {
+    shapes.push([{ role: "user", content }]);
+    shapes.push(content);
+  }
+
+  if (prompt.length > 0) {
+    shapes.push([{ role: "user", content: prompt }]);
+    shapes.push([{ type: "input_text", text: prompt }]);
+    shapes.push([{ type: "text", text: prompt }]);
+    shapes.push([prompt]);
+  }
+
+  return shapes;
+};
+
+const buildRichContentShapes = (
+  prompt: string,
+  images: ChatImageAttachment[]
+): unknown[][] => {
+  const imageShapes = buildImageContentShapes(images);
+  const textParts: Array<Record<string, unknown> | null> =
+    prompt.length > 0
+      ? [
+          { type: "text", text: prompt },
+          { type: "input_text", text: prompt }
+        ]
+      : [null];
+
+  const contents: unknown[][] = [];
+  for (const textPart of textParts) {
+    for (const imageParts of imageShapes) {
+      const content = [
+        ...(textPart ? [textPart] : []),
+        ...imageParts
+      ];
+      if (content.length > 0) {
+        contents.push(content);
+      }
+    }
+  }
+
+  return dedupeByJson(contents);
+};
+
+const buildImageContentShapes = (images: ChatImageAttachment[]): unknown[][] => {
+  if (images.length === 0) {
+    return [[]];
+  }
+
+  return [
+    images.map((image) => ({
+      type: "image_url",
+      image_url: { url: image.url }
+    })),
+    images.map((image) => ({
+      type: "input_image",
+      image_url: { url: image.url }
+    })),
+    images.map((image) => ({ type: "input_image", image_url: image.url })),
+    images.map((image) => ({ type: "image_url", image_url: image.url }))
+  ];
+};
+
+const normalizeOutgoingImages = (
+  images: ComposerSubmission["images"]
+): ChatImageAttachment[] =>
+  images
+    .filter((image) => isSupportedOutgoingImageUrl(image.url))
+    .map((image) => ({ ...image, url: image.url.trim() }));
+
+const isSupportedOutgoingImageUrl = (value: string): boolean => {
+  const normalized = value.trim().toLowerCase();
+  return (
+    normalized.startsWith("data:image/") ||
+    normalized.startsWith("https://") ||
+    normalized.startsWith("http://")
+  );
+};
+
+const dedupeByJson = <T>(values: T[]): T[] => {
+  const seen = new Set<string>();
+  const deduped: T[] = [];
+  for (const value of values) {
+    const key = JSON.stringify(value);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(value);
+  }
+  return deduped;
 };
 
 const callWithFallback = async (
@@ -353,12 +456,57 @@ const parseMessagesFromThread = (
   const combined = [...fromMessages, ...fromTurns];
   const deduped = new Map<string, ChatMessage>();
   for (const message of combined) {
-    deduped.set(message.id, message);
+    const key = messageIdentityKey(message);
+    const current = deduped.get(key);
+    deduped.set(key, current ? mergeMessages(current, message) : message);
   }
 
-  return [...deduped.values()].sort(
-    (a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt)
-  );
+  return [...deduped.values()].sort(sortMessagesAscending);
+};
+
+const messageIdentityKey = (message: ChatMessage): string => {
+  const normalizedTimestamp = normalizeIso(message.createdAt) ?? message.createdAt;
+  return [
+    message.id,
+    message.role,
+    message.eventType ?? "",
+    normalizedTimestamp
+  ].join("::");
+};
+
+const mergeMessages = (current: ChatMessage, incoming: ChatMessage): ChatMessage => {
+  const content =
+    incoming.content.length >= current.content.length ? incoming.content : current.content;
+  const createdAt = pickLatestTimestamp(current.createdAt, incoming.createdAt);
+
+  return {
+    ...current,
+    ...incoming,
+    content,
+    createdAt
+  };
+};
+
+const pickLatestTimestamp = (a: string, b: string): string => {
+  const aMs = Date.parse(a);
+  const bMs = Date.parse(b);
+
+  if (Number.isNaN(aMs)) {
+    return b;
+  }
+  if (Number.isNaN(bMs)) {
+    return a;
+  }
+  return bMs >= aMs ? b : a;
+};
+
+const sortMessagesAscending = (a: ChatMessage, b: ChatMessage): number => {
+  const aMs = parseTimestampMs(a.createdAt);
+  const bMs = parseTimestampMs(b.createdAt);
+  if (aMs === bMs) {
+    return a.id.localeCompare(b.id);
+  }
+  return aMs - bMs;
 };
 
 const parseMessageLike = (
@@ -376,6 +524,7 @@ const parseMessageLike = (
   if (!payload) {
     return [];
   }
+  const images = extractImageAttachments(record);
   const createdAt =
     normalizeIso(pickString(record, ["createdAt", "created_at", "completedAt"])) ??
     new Date().toISOString();
@@ -393,6 +542,7 @@ const parseMessageLike = (
       role,
       content: payload.content,
       createdAt,
+      ...(images.length > 0 ? { images } : {}),
       ...(payload.eventType ? { eventType: payload.eventType } : {})
     }
   ];
@@ -419,6 +569,7 @@ const parseItemLike = (
   if (!payload) {
     return [];
   }
+  const images = extractImageAttachments(record);
 
   const createdAt =
     normalizeIso(
@@ -438,6 +589,7 @@ const parseItemLike = (
       role,
       content: payload.content,
       createdAt,
+      ...(images.length > 0 ? { images } : {}),
       ...(payload.eventType ? { eventType: payload.eventType } : {})
     }
   ];

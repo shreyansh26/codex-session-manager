@@ -24,7 +24,6 @@ export default function App() {
   const sessions = useAppStore((state) => state.sessions);
   const selectedSessionKey = useAppStore((state) => state.selectedSessionKey);
   const messagesBySession = useAppStore((state) => state.messagesBySession);
-  const turnStatusBySession = useAppStore((state) => state.turnStatusBySession);
   const globalError = useAppStore((state) => state.globalError);
 
   const initialize = useAppStore((state) => state.initialize);
@@ -102,9 +101,6 @@ export default function App() {
   );
 
   const messages = selectedSessionKey ? messagesBySession[selectedSessionKey] ?? [] : [];
-  const turnStatus = selectedSessionKey
-    ? turnStatusBySession[selectedSessionKey] ?? "idle"
-    : "idle";
 
   return (
     <div className={`app-shell ${resizingSidebar ? "app-shell--resizing" : ""}`} ref={shellRef}>
@@ -164,11 +160,7 @@ export default function App() {
           </p>
         ) : null}
 
-        <ChatPanel
-          session={selectedSession}
-          messages={messages}
-          turnStatus={turnStatus}
-        />
+        <ChatPanel session={selectedSession} messages={messages} />
         <Composer
           sessionKey={selectedSessionKey}
           disabled={loading || selectedSessionKey === null}

@@ -1,10 +1,9 @@
-import type { ChatMessage, ChatRole, RpcNotification, TurnStatus } from "../domain/types";
-
-export interface ParsedTurnEvent {
-  kind: "turn";
-  threadId: string;
-  status: TurnStatus;
-}
+import type {
+  ChatImageAttachment,
+  ChatMessage,
+  ChatRole,
+  RpcNotification
+} from "../domain/types";
 
 export interface ParsedMessageEvent {
   kind: "message";
@@ -12,7 +11,7 @@ export interface ParsedMessageEvent {
   message: ChatMessage;
 }
 
-export type ParsedRpcEvent = ParsedTurnEvent | ParsedMessageEvent;
+export type ParsedRpcEvent = ParsedMessageEvent;
 
 const normalizeMethod = (method: string): string => method.replaceAll(".", "/");
 
@@ -41,23 +40,50 @@ export const parseRpcNotification = (
   const params = asRecord(notification.params);
   const directThreadId = pickString(params, ["threadId", "thread_id"]);
 
-  if (method === "turn/started" || method === "turn/completed" || method === "turn/failed") {
-    const threadId = directThreadId;
-    if (!threadId) {
+  if (method.startsWith("message/")) {
+    const messageRecord = asRecord(params?.message) ?? params;
+    const threadId = directThreadId ?? pickString(messageRecord, ["threadId", "thread_id"]);
+    if (!threadId || !messageRecord) {
       return null;
     }
 
-    const status: TurnStatus =
-      method === "turn/started"
-        ? "running"
-        : method === "turn/completed"
-          ? "completed"
-          : "failed";
+    const role = inferRole(messageRecord);
+    const payload = extractItemMessagePayload(messageRecord, method, role);
+    if (!payload) {
+      return null;
+    }
+    const images = extractImageAttachments(messageRecord);
+
+    const createdAtRaw =
+      pickString(messageRecord, [
+        "completedAt",
+        "completed_at",
+        "createdAt",
+        "created_at",
+        "startedAt",
+        "started_at",
+        "updatedAt",
+        "updated_at"
+      ]) ?? new Date().toISOString();
+
+    const createdAt = normalizeTimestamp(createdAtRaw) ?? new Date().toISOString();
 
     return {
-      kind: "turn",
+      kind: "message",
       threadId,
-      status
+      message: {
+        id:
+          pickString(messageRecord, ["id", "messageId", "itemId"]) ??
+          `${threadId}-${role}-${Date.now().toString(36)}-${method.replace("/", "-")}`,
+        key: `${deviceId}::${threadId}`,
+        threadId,
+        deviceId,
+        role,
+        content: payload.content,
+        createdAt,
+        ...(images.length > 0 ? { images } : {}),
+        ...(payload.eventType ? { eventType: payload.eventType } : {})
+      }
     };
   }
 
@@ -96,6 +122,7 @@ export const parseRpcNotification = (
   if (!payload) {
     return null;
   }
+  const images = extractImageAttachments(item);
 
   const createdAtRaw =
     pickString(item, [
@@ -127,6 +154,7 @@ export const parseRpcNotification = (
       role: role,
       content: payload.content,
       createdAt,
+      ...(images.length > 0 ? { images } : {}),
       ...(payload.eventType ? { eventType: payload.eventType } : {})
     }
   };
@@ -201,6 +229,112 @@ export const extractText = (input: unknown): string => {
   }
 
   return "";
+};
+
+export const extractImageAttachments = (input: unknown): ChatImageAttachment[] => {
+  const attachments: ChatImageAttachment[] = [];
+  const seenUrls = new Set<string>();
+
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        visit(entry);
+      }
+      return;
+    }
+
+    const record = asRecord(value);
+    if (!record) {
+      return;
+    }
+
+    const imageUrl = extractImageUrlFromRecord(record);
+    if (imageUrl) {
+      const normalized = imageUrl.trim();
+      if (normalized.length > 0 && !seenUrls.has(normalized)) {
+        seenUrls.add(normalized);
+        attachments.push({
+          id: `image-${attachments.length + 1}`,
+          url: normalized,
+          mimeType:
+            pickString(record, [
+              "mimeType",
+              "mime_type",
+              "mediaType",
+              "media_type"
+            ]) ?? inferMimeTypeFromDataUrl(normalized) ?? undefined,
+          fileName: pickString(record, ["fileName", "filename", "name"]) ?? undefined
+        });
+      }
+    }
+
+    for (const nested of Object.values(record)) {
+      if (typeof nested === "object" && nested !== null) {
+        visit(nested);
+      }
+    }
+  };
+
+  visit(input);
+  return attachments;
+};
+
+const extractImageUrlFromRecord = (
+  value: Record<string, unknown>
+): string | null => {
+  const imageUrl =
+    extractImageUrlValue(value.image_url) ??
+    extractImageUrlValue(value.imageUrl) ??
+    extractImageUrlValue(value.image);
+  if (imageUrl && isSupportedImageUrl(imageUrl)) {
+    return imageUrl;
+  }
+
+  const typeHint = (pickString(value, ["type", "itemType", "kind"]) ?? "").toLowerCase();
+  if (!typeHint.includes("image")) {
+    return null;
+  }
+
+  const fallback =
+    extractImageUrlValue(value.url) ??
+    extractImageUrlValue(value.source) ??
+    extractImageUrlValue(value.data);
+  if (fallback && isSupportedImageUrl(fallback)) {
+    return fallback;
+  }
+
+  return null;
+};
+
+const extractImageUrlValue = (value: unknown): string | null => {
+  if (typeof value === "string") {
+    return value;
+  }
+
+  const record = asRecord(value);
+  if (!record) {
+    return null;
+  }
+
+  const nested = record.url;
+  if (typeof nested === "string") {
+    return nested;
+  }
+  return null;
+};
+
+const isSupportedImageUrl = (value: string): boolean => {
+  const normalized = value.trim().toLowerCase();
+  return (
+    normalized.startsWith("data:image/") ||
+    normalized.startsWith("https://") ||
+    normalized.startsWith("http://")
+  );
+};
+
+const inferMimeTypeFromDataUrl = (value: string): string | null => {
+  const match = value.match(/^data:(image\/[a-z0-9.+-]+);/i);
+  return match?.[1]?.toLowerCase() ?? null;
 };
 
 const inferRole = (item: Record<string, unknown>): ChatRole => {

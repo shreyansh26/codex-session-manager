@@ -1,26 +1,12 @@
 import { useEffect, useRef } from "react";
-import type { ChatMessage, SessionSummary, TurnStatus } from "../domain/types";
+import type { ChatMessage, SessionSummary } from "../domain/types";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 interface ChatPanelProps {
   session: SessionSummary | null;
   messages: ChatMessage[];
-  turnStatus: TurnStatus;
 }
-
-const statusText = (status: TurnStatus): string => {
-  if (status === "running") {
-    return "Running";
-  }
-  if (status === "completed") {
-    return "Completed";
-  }
-  if (status === "failed") {
-    return "Failed";
-  }
-  return "Idle";
-};
 
 const formatFullTimestamp = (timestamp: string): string => {
   const date = new Date(timestamp);
@@ -52,11 +38,9 @@ const messageLabel = (message: ChatMessage): string => {
   return message.role;
 };
 
-export default function ChatPanel({
-  session,
-  messages,
-  turnStatus
-}: ChatPanelProps) {
+const hasTextContent = (value: string): boolean => value.trim().length > 0;
+
+export default function ChatPanel({ session, messages }: ChatPanelProps) {
   const panelRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
@@ -94,9 +78,6 @@ export default function ChatPanel({
           </p>
           <p className="chat-panel__address">{session.deviceAddress}</p>
         </div>
-        <span className={`turn-pill turn-pill--${turnStatus}`}>
-          {statusText(turnStatus)}
-        </span>
       </header>
 
       <ol className="chat-panel__timeline">
@@ -104,9 +85,9 @@ export default function ChatPanel({
           <li className="chat-panel__no-messages">No messages loaded yet.</li>
         ) : null}
 
-        {messages.map((message) => (
+        {messages.map((message, index) => (
           <li
-            key={message.id}
+            key={`${message.id}-${message.role}-${message.createdAt}-${index}`}
             className={`bubble bubble--${message.role} ${
               message.eventType === "reasoning" && message.role !== "user"
                 ? "bubble--reasoning"
@@ -116,9 +97,24 @@ export default function ChatPanel({
             }`}
           >
             <p className="bubble__role">{messageLabel(message)}</p>
-            <ReactMarkdown className="bubble__markdown" remarkPlugins={[remarkGfm]}>
-              {message.content}
-            </ReactMarkdown>
+            {hasTextContent(message.content) ? (
+              <ReactMarkdown className="bubble__markdown" remarkPlugins={[remarkGfm]}>
+                {message.content}
+              </ReactMarkdown>
+            ) : null}
+            {message.images && message.images.length > 0 ? (
+              <div className="bubble__images">
+                {message.images.map((image, imageIndex) => (
+                  <img
+                    key={`${image.id}-${imageIndex}`}
+                    className="bubble__image"
+                    src={image.url}
+                    alt={image.fileName ?? `Image attachment ${imageIndex + 1}`}
+                    loading="lazy"
+                  />
+                ))}
+              </div>
+            ) : null}
           </li>
         ))}
       </ol>

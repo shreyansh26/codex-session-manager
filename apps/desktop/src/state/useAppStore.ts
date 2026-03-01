@@ -2,11 +2,11 @@ import { create } from "zustand";
 import { makeSessionKey } from "../domain/sessionKey";
 import type {
   ChatMessage,
+  ComposerSubmission,
   DeviceAddSshRequest,
   DeviceRecord,
   RpcNotification,
-  SessionSummary,
-  TurnStatus
+  SessionSummary
 } from "../domain/types";
 import {
   closeAllClients,
@@ -35,7 +35,6 @@ interface AppStore {
   sessions: SessionSummary[];
   selectedSessionKey: string | null;
   messagesBySession: Record<string, ChatMessage[]>;
-  turnStatusBySession: Record<string, TurnStatus>;
   globalError: string | null;
   initializing: boolean;
   initialize: () => Promise<void>;
@@ -47,7 +46,7 @@ interface AppStore {
     threadId: string,
     options?: { preserveSummary?: boolean; skipMessages?: boolean }
   ) => Promise<void>;
-  submitComposer: (prompt: string) => Promise<void>;
+  submitComposer: (submission: ComposerSubmission) => Promise<void>;
   addSsh: (request: DeviceAddSshRequest) => Promise<void>;
   connect: (deviceId: string) => Promise<void>;
   disconnect: (deviceId: string) => Promise<void>;
@@ -56,6 +55,13 @@ interface AppStore {
 }
 
 const fallbackLocalName = "Local Device";
+const NOTIFICATION_REFRESH_MIN_INTERVAL_MS = 350;
+const STREAMING_MERGE_WINDOW_MS = 10_000;
+const POST_SEND_REFRESH_BURST_MS = 45_000;
+const POST_SEND_REFRESH_INTERVAL_MS = 1_200;
+const POST_SEND_REFRESH_INITIAL_DELAYS_MS = [250, 700, 1_300];
+const PENDING_OPTIMISTIC_RETAIN_MS = 120_000;
+const RECENT_SERVER_MESSAGE_RETAIN_MS = 45_000;
 
 const pickSelectedSession = (
   preferred: string | null,
@@ -80,18 +86,194 @@ const upsertDevice = (
     .sort((a, b) => a.name.localeCompare(b.name));
 };
 
-const appendMessageUnique = (
+const upsertMessage = (
   existing: ChatMessage[],
   incoming: ChatMessage
 ): ChatMessage[] => {
-  if (existing.some((entry) => entry.id === incoming.id)) {
-    return existing;
+  const existingIndex = existing.findIndex((entry) =>
+    isSameLogicalMessage(entry, incoming)
+  );
+  if (existingIndex === -1) {
+    return [...existing, incoming].sort(sortMessagesAscending);
   }
 
-  return [...existing, incoming].sort(
-    (a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt)
+  const current = existing[existingIndex];
+  const merged: ChatMessage = {
+    ...current,
+    ...incoming,
+    content:
+      incoming.content.length >= current.content.length
+        ? incoming.content
+        : current.content,
+    createdAt: pickLatestTimestamp(current.createdAt, incoming.createdAt)
+  };
+
+  const next = [...existing];
+  next[existingIndex] = merged;
+  return next.sort(sortMessagesAscending);
+};
+
+const normalizeMessageText = (value: string): string =>
+  value.replace(/\s+/g, " ").trim();
+
+const isOptimisticMessage = (message: ChatMessage): boolean =>
+  message.id.startsWith("local-");
+
+const imageSignature = (message: ChatMessage): string =>
+  (message.images ?? [])
+    .map((image) => image.url.trim())
+    .filter((url) => url.length > 0)
+    .join("|");
+
+const timestampsCloseEnough = (
+  aIso: string,
+  bIso: string,
+  thresholdMs: number
+): boolean => {
+  const aMs = Date.parse(aIso);
+  const bMs = Date.parse(bIso);
+  if (Number.isNaN(aMs) || Number.isNaN(bMs)) {
+    return true;
+  }
+  return Math.abs(aMs - bMs) <= thresholdMs;
+};
+
+const hasAcknowledgedEquivalent = (
+  optimistic: ChatMessage,
+  incoming: ChatMessage
+): boolean => {
+  if (optimistic.role !== "user" || incoming.role !== "user") {
+    return false;
+  }
+
+  const optimisticText = normalizeMessageText(optimistic.content);
+  const incomingText = normalizeMessageText(incoming.content);
+  if (optimisticText !== incomingText) {
+    return false;
+  }
+
+  if (imageSignature(optimistic) !== imageSignature(incoming)) {
+    return false;
+  }
+
+  return timestampsCloseEnough(optimistic.createdAt, incoming.createdAt, 120_000);
+};
+
+const isSameLogicalMessage = (
+  current: ChatMessage,
+  incoming: ChatMessage
+): boolean => {
+  if (
+    current.id !== incoming.id ||
+    current.role !== incoming.role ||
+    (current.eventType ?? "") !== (incoming.eventType ?? "")
+  ) {
+    return false;
+  }
+
+  if (current.createdAt === incoming.createdAt) {
+    return true;
+  }
+
+  const currentMs = Date.parse(current.createdAt);
+  const incomingMs = Date.parse(incoming.createdAt);
+  if (Number.isNaN(currentMs) || Number.isNaN(incomingMs)) {
+    return false;
+  }
+
+  if (Math.abs(currentMs - incomingMs) > STREAMING_MERGE_WINDOW_MS) {
+    return false;
+  }
+
+  const currentContent = normalizeMessageText(current.content);
+  const incomingContent = normalizeMessageText(incoming.content);
+  if (currentContent.length === 0 || incomingContent.length === 0) {
+    return true;
+  }
+
+  return (
+    currentContent === incomingContent ||
+    currentContent.startsWith(incomingContent) ||
+    incomingContent.startsWith(currentContent)
   );
 };
+
+const pickLatestTimestamp = (a: string, b: string): string => {
+  const aMs = Date.parse(a);
+  const bMs = Date.parse(b);
+
+  if (Number.isNaN(aMs)) {
+    return b;
+  }
+  if (Number.isNaN(bMs)) {
+    return a;
+  }
+  return bMs >= aMs ? b : a;
+};
+
+const sortMessagesAscending = (a: ChatMessage, b: ChatMessage): number => {
+  const aMs = Date.parse(a.createdAt);
+  const bMs = Date.parse(b.createdAt);
+  if (Number.isNaN(aMs) && Number.isNaN(bMs)) {
+    return a.id.localeCompare(b.id);
+  }
+  if (Number.isNaN(aMs)) {
+    return 1;
+  }
+  if (Number.isNaN(bMs)) {
+    return -1;
+  }
+  if (aMs === bMs) {
+    return a.id.localeCompare(b.id);
+  }
+  return aMs - bMs;
+};
+
+const mergeThreadMessages = (
+  existing: ChatMessage[],
+  incoming: ChatMessage[]
+): ChatMessage[] => {
+  let merged = [...incoming];
+  const nowMs = Date.now();
+
+  for (const message of existing) {
+    const alreadyPresent = merged.some(
+      (entry) =>
+        isSameLogicalMessage(entry, message) ||
+        hasAcknowledgedEquivalent(message, entry)
+    );
+    if (alreadyPresent) {
+      continue;
+    }
+
+    const createdAtMs = Date.parse(message.createdAt);
+    const ageMs = Number.isNaN(createdAtMs) ? 0 : nowMs - createdAtMs;
+    const keepOptimisticPending =
+      isOptimisticMessage(message) &&
+      message.role === "user" &&
+      ageMs <= PENDING_OPTIMISTIC_RETAIN_MS;
+    const keepRecentServerMessage =
+      !isOptimisticMessage(message) && ageMs <= RECENT_SERVER_MESSAGE_RETAIN_MS;
+
+    if (!keepOptimisticPending && !keepRecentServerMessage) {
+      continue;
+    }
+
+    merged = upsertMessage(merged, message);
+  }
+
+  return merged.sort(sortMessagesAscending);
+};
+
+const normalizeSubmissionImages = (
+  images: ComposerSubmission["images"]
+): ComposerSubmission["images"] =>
+  images
+    .filter((image) => typeof image.url === "string" && image.url.trim().length > 0)
+    .map((image) => ({
+      ...image,
+      url: image.url.trim()
+    }));
 
 const findLocalDevice = (devices: DeviceRecord[]): DeviceRecord | null =>
   devices.find((device) => device.config.kind === "local") ?? null;
@@ -127,32 +309,128 @@ const sessionsEqual = (
   return true;
 };
 
+const asRecord = (value: unknown): Record<string, unknown> | null =>
+  typeof value === "object" && value !== null ? (value as Record<string, unknown>) : null;
+
+const pickString = (
+  value: Record<string, unknown> | null | undefined,
+  keys: string[]
+): string | null => {
+  if (!value) {
+    return null;
+  }
+
+  for (const key of keys) {
+    const candidate = value[key];
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return candidate;
+    }
+  }
+
+  return null;
+};
+
 export const useAppStore = create<AppStore>((set, get) => {
+  const notificationRefreshAtMs = new Map<string, number>();
+  const postSendRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  const stopPostSendRefresh = (sessionKey: string): void => {
+    const pendingTimer = postSendRefreshTimers.get(sessionKey);
+    if (pendingTimer !== undefined) {
+      clearTimeout(pendingTimer);
+      postSendRefreshTimers.delete(sessionKey);
+    }
+  };
+
+  const stopPostSendRefreshesForDevice = (deviceId: string): void => {
+    const prefix = `${deviceId}::`;
+    for (const sessionKey of postSendRefreshTimers.keys()) {
+      if (sessionKey.startsWith(prefix)) {
+        stopPostSendRefresh(sessionKey);
+      }
+    }
+  };
+
+  const startPostSendRefreshBurst = (params: {
+    sessionKey: string;
+    deviceId: string;
+    threadId: string;
+  }): void => {
+    stopPostSendRefresh(params.sessionKey);
+
+    for (const delayMs of POST_SEND_REFRESH_INITIAL_DELAYS_MS) {
+      setTimeout(() => {
+        void get().refreshThread(params.deviceId, params.threadId, {
+          preserveSummary: true
+        });
+      }, delayMs);
+    }
+
+    const startedAt = Date.now();
+    const tick = (): void => {
+      void get().refreshThread(params.deviceId, params.threadId, {
+        preserveSummary: true
+      });
+
+      if (Date.now() - startedAt >= POST_SEND_REFRESH_BURST_MS) {
+        stopPostSendRefresh(params.sessionKey);
+        return;
+      }
+
+      const pendingTimer = setTimeout(tick, POST_SEND_REFRESH_INTERVAL_MS);
+      postSendRefreshTimers.set(params.sessionKey, pendingTimer);
+    };
+
+    const pendingTimer = setTimeout(tick, POST_SEND_REFRESH_INTERVAL_MS);
+    postSendRefreshTimers.set(params.sessionKey, pendingTimer);
+  };
+
+  const refreshThreadFromNotification = (
+    deviceId: string,
+    notification: RpcNotification
+  ): void => {
+    const method = notification.method.replaceAll(".", "/").toLowerCase();
+    if (
+      !method.startsWith("turn/") &&
+      !method.startsWith("message/") &&
+      !method.startsWith("item/")
+    ) {
+      return;
+    }
+
+    const params = asRecord(notification.params);
+    const threadId =
+      pickString(params, ["threadId", "thread_id"]) ??
+      pickString(asRecord(params?.message), ["threadId", "thread_id"]) ??
+      pickString(asRecord(params?.item), ["threadId", "thread_id"]) ??
+      pickString(asRecord(params?.turn), ["threadId", "thread_id"]);
+    if (!threadId) {
+      return;
+    }
+
+    const sessionKey = makeSessionKey(deviceId, threadId);
+    const nowMs = Date.now();
+    const lastRefreshMs = notificationRefreshAtMs.get(sessionKey) ?? 0;
+    if (nowMs - lastRefreshMs < NOTIFICATION_REFRESH_MIN_INTERVAL_MS) {
+      return;
+    }
+    notificationRefreshAtMs.set(sessionKey, nowMs);
+
+    void get().refreshThread(deviceId, threadId, { preserveSummary: true });
+  };
+
   const applyNotification = (deviceId: string, notification: RpcNotification): void => {
     const parsed = parseRpcNotification(deviceId, notification);
     if (!parsed) {
+      refreshThreadFromNotification(deviceId, notification);
       return;
     }
 
     const sessionKey = makeSessionKey(deviceId, parsed.threadId);
 
-    if (parsed.kind === "turn") {
-      set((state) => ({
-        turnStatusBySession: {
-          ...state.turnStatusBySession,
-          [sessionKey]: parsed.status
-        }
-      }));
-
-      if (parsed.status === "completed" || parsed.status === "failed") {
-        void get().refreshThread(deviceId, parsed.threadId);
-      }
-      return;
-    }
-
     set((state) => {
       const current = state.messagesBySession[sessionKey] ?? [];
-      const next = appendMessageUnique(current, parsed.message);
+      const next = upsertMessage(current, parsed.message);
       return {
         messagesBySession: {
           ...state.messagesBySession,
@@ -160,6 +438,7 @@ export const useAppStore = create<AppStore>((set, get) => {
         }
       };
     });
+    refreshThreadFromNotification(deviceId, notification);
   };
 
   const ensureDeviceConnected = async (device: DeviceRecord): Promise<void> => {
@@ -182,7 +461,6 @@ export const useAppStore = create<AppStore>((set, get) => {
     sessions: [],
     selectedSessionKey: null,
     messagesBySession: {},
-    turnStatusBySession: {},
     globalError: null,
     initialize: async () => {
       if (get().initializing) {
@@ -310,8 +588,7 @@ export const useAppStore = create<AppStore>((set, get) => {
       const selected = get().selectedSessionKey;
       if (selected) {
         const session = get().sessions.find((entry) => entry.key === selected);
-        const existingMessages = get().messagesBySession[selected] ?? [];
-        if (session && existingMessages.length === 0) {
+        if (session) {
           await get().refreshThread(session.deviceId, session.threadId, {
             preserveSummary: true
           });
@@ -403,25 +680,25 @@ export const useAppStore = create<AppStore>((set, get) => {
               ? state.messagesBySession
               : {
                   ...state.messagesBySession,
-                  [payload.session.key]: payload.messages
-                },
-            turnStatusBySession: {
-              ...state.turnStatusBySession,
-              [payload.session.key]: state.turnStatusBySession[payload.session.key] ?? "idle"
-            }
+                  [payload.session.key]: mergeThreadMessages(
+                    state.messagesBySession[payload.session.key] ?? [],
+                    payload.messages
+                  )
+                }
           };
         });
       } catch (error) {
         set({ globalError: toErrorMessage(error) });
       }
     },
-    submitComposer: async (promptInput) => {
+    submitComposer: async (submissionInput) => {
       const state = get();
       const session = state.sessions.find(
         (entry) => entry.key === state.selectedSessionKey
       );
-      const prompt = promptInput.trim();
-      if (!session || prompt.length === 0) {
+      const prompt = submissionInput.prompt.trim();
+      const images = normalizeSubmissionImages(submissionInput.images);
+      if (!session || (prompt.length === 0 && images.length === 0)) {
         return;
       }
 
@@ -440,50 +717,37 @@ export const useAppStore = create<AppStore>((set, get) => {
         deviceId: session.deviceId,
         role: "user",
         content: prompt,
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
+        ...(images.length > 0 ? { images } : {})
       };
 
       set((prev) => ({
         messagesBySession: {
           ...prev.messagesBySession,
-          [session.key]: appendMessageUnique(
+          [session.key]: upsertMessage(
             prev.messagesBySession[session.key] ?? [],
             optimisticUserMessage
           )
         },
-        turnStatusBySession: {
-          ...prev.turnStatusBySession,
-          [session.key]: "running"
-        },
         globalError: null
       }));
 
-      const refreshWithGap = (attempt = 0): void => {
-        const delayMs = attempt === 0 ? 250 : attempt === 1 ? 700 : 1300;
-        setTimeout(() => {
-          const currentTurnStatus = get().turnStatusBySession[session.key];
-          if (currentTurnStatus === "running") {
-            void get().refreshThread(session.deviceId, session.threadId);
-            if (attempt < 2) {
-              refreshWithGap(attempt + 1);
-            }
-          }
-        }, delayMs);
-      };
+      startPostSendRefreshBurst({
+        sessionKey: session.key,
+        deviceId: session.deviceId,
+        threadId: session.threadId
+      });
 
       void (async () => {
         try {
           await resumeThread(device, session.threadId);
-          await startTurn(device, session.threadId, prompt);
-          refreshWithGap(0);
+          await startTurn(device, session.threadId, {
+            prompt,
+            images
+          });
         } catch (error) {
-          set((prev) => ({
-            turnStatusBySession: {
-              ...prev.turnStatusBySession,
-              [session.key]: "failed"
-            },
-            globalError: toErrorMessage(error)
-          }));
+          stopPostSendRefresh(session.key);
+          set({ globalError: toErrorMessage(error) });
         }
       })();
     },
@@ -516,15 +780,11 @@ export const useAppStore = create<AppStore>((set, get) => {
     },
     disconnect: async (deviceId) => {
       try {
+        stopPostSendRefreshesForDevice(deviceId);
         const disconnected = await disconnectDevice(deviceId);
         closeDeviceClient(deviceId);
         set((state) => ({
-          devices: upsertDevice(state.devices, disconnected),
-          turnStatusBySession: Object.fromEntries(
-            Object.entries(state.turnStatusBySession).filter(
-              ([key]) => !key.startsWith(`${deviceId}::`)
-            )
-          )
+          devices: upsertDevice(state.devices, disconnected)
         }));
       } catch (error) {
         set({ globalError: toErrorMessage(error) });
@@ -532,6 +792,7 @@ export const useAppStore = create<AppStore>((set, get) => {
     },
     remove: async (deviceId) => {
       try {
+        stopPostSendRefreshesForDevice(deviceId);
         const devices = await removeDevice(deviceId);
         closeDeviceClient(deviceId);
         set((state) => {
@@ -541,17 +802,11 @@ export const useAppStore = create<AppStore>((set, get) => {
               ([key]) => !key.startsWith(`${deviceId}::`)
             )
           );
-          const turnStatusBySession = Object.fromEntries(
-            Object.entries(state.turnStatusBySession).filter(
-              ([key]) => !key.startsWith(`${deviceId}::`)
-            )
-          );
 
           return {
             devices,
             sessions,
             messagesBySession,
-            turnStatusBySession,
             selectedSessionKey: pickSelectedSession(state.selectedSessionKey, sessions)
           };
         });

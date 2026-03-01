@@ -307,7 +307,9 @@ export default function Sidebar({
                           onClick={() => onSelectSession(session.key)}
                         >
                           <div className="session-row__meta">
-                            <strong className="session-row__title">{session.title}</strong>
+                            <div className="session-row__title-wrap">
+                              <strong className="session-row__title">{session.title}</strong>
+                            </div>
                             <span
                               className="session-row__timestamp"
                               title={new Date(session.updatedAt).toLocaleString()}

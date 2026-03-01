@@ -6,21 +6,6 @@ import {
 } from "../services/eventParser";
 
 describe("parseRpcNotification", () => {
-  it("parses turn/completed notification", () => {
-    const parsed = parseRpcNotification("device-1", {
-      method: "turn/completed",
-      params: {
-        threadId: "thread-123"
-      }
-    });
-
-    expect(parsed).toEqual({
-      kind: "turn",
-      threadId: "thread-123",
-      status: "completed"
-    });
-  });
-
   it("parses item/completed notification into chat message", () => {
     const parsed = parseRpcNotification("device-2", {
       method: "item/completed",
@@ -46,6 +31,94 @@ describe("parseRpcNotification", () => {
         role: "assistant",
         content: "Hello from assistant",
         createdAt: "2026-03-01T12:00:00.000Z"
+      }
+    });
+  });
+
+  it("parses message/completed notification into chat message", () => {
+    const parsed = parseRpcNotification("device-2", {
+      method: "message/completed",
+      params: {
+        threadId: "thread-777",
+        message: {
+          id: "msg-1",
+          role: "assistant",
+          content: "Done.",
+          createdAt: "2026-03-01T12:01:00.000Z"
+        }
+      }
+    });
+
+    expect(parsed).toEqual({
+      kind: "message",
+      threadId: "thread-777",
+      message: {
+        id: "msg-1",
+        key: "device-2::thread-777",
+        threadId: "thread-777",
+        deviceId: "device-2",
+        role: "assistant",
+        content: "Done.",
+        createdAt: "2026-03-01T12:01:00.000Z"
+      }
+    });
+  });
+
+  it("extracts image attachments from message notifications", () => {
+    const parsed = parseRpcNotification("device-5", {
+      method: "message/completed",
+      params: {
+        threadId: "thread-img",
+        message: {
+          id: "msg-img-1",
+          role: "user",
+          content: [
+            { type: "input_text", text: "What is in this image?" },
+            { type: "input_image", image_url: "data:image/png;base64,abc123" }
+          ],
+          createdAt: "2026-03-01T12:03:00.000Z"
+        }
+      }
+    });
+
+    expect(parsed).toMatchObject({
+      kind: "message",
+      threadId: "thread-img",
+      message: {
+        id: "msg-img-1",
+        role: "user",
+        content: "What is in this image?",
+        images: [{ url: "data:image/png;base64,abc123" }]
+      }
+    });
+  });
+
+  it("does not misclassify message status payload as turn event", () => {
+    const parsed = parseRpcNotification("device-4", {
+      method: "message/completed",
+      params: {
+        threadId: "thread-901",
+        status: "completed",
+        message: {
+          id: "msg-2",
+          role: "assistant",
+          content: "Final answer",
+          createdAt: "2026-03-01T12:02:00.000Z"
+        }
+      }
+    });
+
+    expect(parsed).toEqual({
+      kind: "message",
+      threadId: "thread-901",
+      message: {
+        id: "msg-2",
+        key: "device-4::thread-901",
+        threadId: "thread-901",
+        deviceId: "device-4",
+        role: "assistant",
+        content: "Final answer",
+        createdAt: "2026-03-01T12:02:00.000Z"
       }
     });
   });
