@@ -1,0 +1,625 @@
+.app-shell {
+  display: flex;
+  height: 100%;
+  padding: 1rem;
+  min-width: 0;
+  min-height: 0;
+}
+
+.sidebar,
+.workspace {
+  background: color-mix(in srgb, var(--bg-raised) 92%, #000);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  min-height: 0;
+}
+
+.app-shell__sidebar-pane {
+  flex: 0 0 auto;
+  min-width: 280px;
+  max-width: 62vw;
+  min-height: 0;
+  display: flex;
+}
+
+.app-shell__splitter {
+  width: 10px;
+  margin: 0 0.3rem;
+  border: none;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--line) 75%, transparent);
+  cursor: col-resize;
+  flex: 0 0 10px;
+  transition: background 0.18s ease;
+}
+
+.app-shell__splitter:hover,
+.app-shell--resizing .app-shell__splitter {
+  background: color-mix(in srgb, var(--accent) 45%, var(--line));
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+  overflow: auto;
+}
+
+.workspace {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.sidebar__header {
+  padding: 1rem 1rem 0.8rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.sidebar__eyebrow {
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.sidebar__title {
+  margin: 0.15rem 0 0;
+  font-family: "Space Grotesk", "IBM Plex Sans", sans-serif;
+  font-size: 1.2rem;
+}
+
+.sidebar__new-device {
+  border-bottom: 1px solid var(--line);
+  padding: 0.8rem 1rem;
+  display: grid;
+  gap: 0.65rem;
+}
+
+.sidebar__new-device details {
+  border: 1px solid color-mix(in srgb, var(--line) 80%, transparent);
+  border-radius: 10px;
+  padding: 0.45rem 0.55rem;
+  background: color-mix(in srgb, var(--bg-soft) 72%, transparent);
+}
+
+.sidebar__new-device summary {
+  cursor: pointer;
+  font-size: 0.83rem;
+  color: var(--text-main);
+}
+
+.sidebar__new-device-form {
+  margin-top: 0.6rem;
+  display: grid;
+  gap: 0.45rem;
+}
+
+.sidebar__new-device-form input {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(9, 12, 18, 0.85);
+  color: var(--text-main);
+  padding: 0.45rem 0.55rem;
+}
+
+.sidebar__new-device-form button {
+  border: 1px solid color-mix(in srgb, var(--accent) 72%, transparent);
+  background: color-mix(in srgb, var(--accent-soft) 80%, #12261d);
+  color: #e8fff3;
+  border-radius: 8px;
+  padding: 0.38rem 0.62rem;
+  cursor: pointer;
+}
+
+.sidebar__local-note {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.73rem;
+}
+
+.sidebar__groups {
+  overflow: auto;
+  padding: 0.75rem;
+}
+
+.sidebar__device-group {
+  border: 1px solid color-mix(in srgb, var(--line) 80%, transparent);
+  border-radius: 12px;
+  padding: 0.6rem;
+  background: color-mix(in srgb, var(--bg-soft) 80%, transparent);
+}
+
+.sidebar__device-group + .sidebar__device-group {
+  margin-top: 0.75rem;
+}
+
+.sidebar__device-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  align-items: flex-start;
+  margin-bottom: 0.45rem;
+}
+
+.sidebar__device-meta-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.38rem;
+  min-width: 0;
+}
+
+.sidebar__collapse-toggle {
+  border: 1px solid color-mix(in srgb, var(--line) 85%, transparent);
+  background: rgba(9, 13, 18, 0.75);
+  color: color-mix(in srgb, var(--text-muted) 90%, #dbe9ff);
+  border-radius: 7px;
+  font-size: 0.78rem;
+  line-height: 1;
+  width: 1.45rem;
+  height: 1.45rem;
+  padding: 0;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.sidebar__collapse-toggle:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  color: var(--text-main);
+}
+
+.sidebar__device-meta h2 {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.sidebar__device-meta p {
+  margin: 0.25rem 0 0;
+  font-size: 0.74rem;
+  color: var(--text-muted);
+}
+
+.sidebar__device-actions {
+  display: flex;
+  gap: 0.4rem;
+  margin-bottom: 0.5rem;
+}
+
+.sidebar__device-actions button {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgba(9, 13, 18, 0.85);
+  color: var(--text-main);
+  font-size: 0.72rem;
+  padding: 0.25rem 0.45rem;
+  cursor: pointer;
+}
+
+.sidebar__device-actions button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.sidebar__device-error {
+  margin: 0.2rem 0 0.45rem;
+  color: #ffc1c1;
+  font-size: 0.74rem;
+}
+
+.status-pill {
+  border-radius: 999px;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.67rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.status-pill--connected {
+  background: color-mix(in srgb, var(--accent) 35%, transparent);
+  color: #9ef2ca;
+}
+
+.status-pill--disconnected {
+  background: rgba(124, 138, 162, 0.25);
+  color: #c4cfdf;
+}
+
+.status-pill--error {
+  background: rgba(223, 106, 106, 0.22);
+  color: #ffb2b2;
+}
+
+.sidebar__session-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.45rem;
+}
+
+.sidebar__session-list li {
+  min-width: 0;
+}
+
+.sidebar__empty {
+  color: var(--text-muted);
+  font-size: 0.81rem;
+  margin: 0;
+}
+
+.sidebar__collapsed-note {
+  margin: 0.1rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.77rem;
+}
+
+.session-row {
+  width: 100%;
+  text-align: left;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  padding: 0.55rem;
+  background: rgba(10, 12, 16, 0.4);
+  color: inherit;
+  cursor: pointer;
+  transition: border-color 0.18s ease, background-color 0.18s ease;
+  box-sizing: border-box;
+  overflow: hidden;
+  display: block;
+  min-width: 0;
+}
+
+.session-row:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+}
+
+.session-row--active {
+  border-color: color-mix(in srgb, var(--accent) 70%, transparent);
+  background: rgba(20, 42, 33, 0.45);
+}
+
+.session-row__meta {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.55rem;
+  align-items: center;
+  min-width: 0;
+}
+
+.session-row__title {
+  display: block;
+  font-size: 0.83rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.session-row__timestamp {
+  flex-shrink: 0;
+  color: color-mix(in srgb, var(--text-muted) 88%, #dbe8ff);
+  font-size: 0.69rem;
+  white-space: nowrap;
+  text-align: right;
+  width: 4.4ch;
+  justify-self: end;
+}
+
+.session-row__folder-chip {
+  display: inline-flex;
+  margin-top: 0.35rem;
+  border: 1px solid color-mix(in srgb, var(--line) 85%, transparent);
+  border-radius: 999px;
+  padding: 0.12rem 0.45rem;
+  font-size: 0.67rem;
+  color: color-mix(in srgb, var(--text-muted) 90%, #d7e5ff);
+  background: rgba(12, 18, 28, 0.75);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace {
+  display: grid;
+  grid-template-rows: auto auto 1fr auto;
+  overflow: hidden;
+}
+
+.workspace__topbar {
+  border-bottom: 1px solid var(--line);
+  padding: 0.7rem 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.workspace__topbar h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.workspace__topbar button {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(12, 16, 22, 0.85);
+  color: var(--text-main);
+  padding: 0.35rem 0.62rem;
+  cursor: pointer;
+}
+
+.workspace__banner {
+  margin: 0;
+  padding: 0.62rem 1rem;
+  border-bottom: 1px solid var(--line);
+  color: var(--text-muted);
+}
+
+.workspace__banner--error {
+  color: #ffd4d4;
+  background: rgba(114, 28, 28, 0.35);
+  cursor: pointer;
+}
+
+.chat-panel {
+  padding: 1rem;
+  overflow: auto;
+  min-height: 0;
+}
+
+.chat-panel--empty {
+  display: grid;
+  place-content: center;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.chat-panel__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.chat-panel__eyebrow {
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.chat-panel__header h2 {
+  margin: 0.22rem 0 0;
+}
+
+.chat-panel__updated-at {
+  margin: 0.26rem 0 0;
+  font-size: 0.76rem;
+  color: color-mix(in srgb, var(--text-muted) 90%, #dbe9ff);
+}
+
+.chat-panel__address {
+  margin: 0.2rem 0 0;
+  font-size: 0.74rem;
+  color: var(--text-muted);
+}
+
+.turn-pill {
+  border-radius: 999px;
+  font-size: 0.71rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 0.27rem 0.62rem;
+}
+
+.turn-pill--idle {
+  background: rgba(124, 138, 162, 0.25);
+  color: #c4cfdf;
+}
+
+.turn-pill--running {
+  background: color-mix(in srgb, #4cbbe7 45%, transparent);
+  color: #c9f1ff;
+  animation: pulse 1.2s infinite ease-in-out;
+}
+
+.turn-pill--completed {
+  background: rgba(76, 201, 144, 0.28);
+  color: #abffda;
+}
+
+.turn-pill--failed {
+  background: rgba(223, 106, 106, 0.25);
+  color: #ffc3c3;
+}
+
+.chat-panel__timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.72rem;
+}
+
+.chat-panel__no-messages {
+  color: var(--text-muted);
+  font-size: 0.82rem;
+}
+
+.bubble {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 0.75rem;
+  max-width: min(80ch, 100%);
+  line-height: 1.45;
+}
+
+.bubble p {
+  margin: 0;
+}
+
+.bubble__role {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  margin-bottom: 0.35rem !important;
+}
+
+.bubble--assistant {
+  background: color-mix(in srgb, #355684 35%, transparent);
+  margin-right: auto;
+}
+
+.bubble--assistant.bubble--reasoning {
+  background: color-mix(in srgb, #ffb36f 28%, transparent);
+  border-color: color-mix(in srgb, #ffb36f 65%, var(--line));
+  border-style: dashed;
+  margin-right: auto;
+}
+
+.bubble--activity {
+  background: color-mix(in srgb, #7e8ca6 22%, transparent);
+  border-color: color-mix(in srgb, #a8b4c8 58%, var(--line));
+  border-style: dotted;
+  margin-right: auto;
+}
+
+.bubble--user {
+  background: color-mix(in srgb, #1f5f45 38%, transparent);
+  margin-left: auto;
+}
+
+.bubble--system,
+.bubble--tool {
+  background: color-mix(in srgb, #695028 40%, transparent);
+  margin-inline: auto;
+}
+
+.bubble__markdown {
+  font-size: 0.92rem;
+  line-height: 1.45;
+}
+
+.bubble__markdown > :first-child {
+  margin-top: 0;
+}
+
+.bubble__markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.bubble__markdown p,
+.bubble__markdown ul,
+.bubble__markdown ol,
+.bubble__markdown blockquote,
+.bubble__markdown pre {
+  margin: 0.45rem 0;
+}
+
+.bubble__markdown code {
+  font-family: "IBM Plex Mono", "SFMono-Regular", Menlo, monospace;
+  font-size: 0.86em;
+}
+
+.bubble__markdown pre {
+  border: 1px solid color-mix(in srgb, var(--line) 85%, transparent);
+  border-radius: 8px;
+  padding: 0.6rem 0.7rem;
+  overflow: auto;
+  background: rgba(5, 8, 14, 0.7);
+}
+
+.composer {
+  border-top: 1px solid var(--line);
+  padding: 0.85rem 1rem 1rem;
+  background: linear-gradient(180deg, rgba(20, 24, 32, 0.75), rgba(15, 18, 24, 0.98));
+}
+
+.composer textarea {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(7, 9, 12, 0.8);
+  color: inherit;
+  padding: 0.7rem;
+}
+
+.composer textarea:focus {
+  outline: 1px solid color-mix(in srgb, var(--accent) 60%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--line));
+}
+
+.composer__actions {
+  margin-top: 0.55rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+}
+
+.composer__actions p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+.composer button {
+  border: 1px solid color-mix(in srgb, var(--accent) 72%, transparent);
+  background: color-mix(in srgb, var(--accent-soft) 80%, #12261d);
+  color: #e8fff3;
+  border-radius: 10px;
+  padding: 0.45rem 0.8rem;
+  cursor: pointer;
+}
+
+.composer button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+@keyframes pulse {
+  0% {
+    opacity: 0.6;
+  }
+  50% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0.6;
+  }
+}
+
+@media (max-width: 980px) {
+  .app-shell {
+    display: grid;
+    grid-template-columns: 1fr;
+    grid-template-rows: minmax(260px, 48dvh) 1fr;
+    padding: 0.7rem;
+    gap: 0.7rem;
+  }
+
+  .sidebar,
+  .workspace {
+    min-height: 0;
+  }
+
+  .app-shell__sidebar-pane {
+    width: auto !important;
+    min-width: 0;
+    max-width: none;
+  }
+
+  .app-shell__splitter {
+    display: none;
+  }
+
+  .sidebar__device-actions {
+    flex-wrap: wrap;
+  }
+}

@@ -1,0 +1,708 @@
+use std::collections::HashMap;
+use std::fs;
+use std::io;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Mutex, MutexGuard};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use thiserror::Error;
+use tracing::{error, info, warn};
+use uuid::Uuid;
+
+use crate::state::models::{
+    DeviceAddLocalRequest, DeviceAddSshRequest, DeviceConfig, DeviceConnection, DeviceRecord,
+    LocalDeviceConfig, PersistedDevices, SshDeviceConfig, DEFAULT_REMOTE_APP_SERVER_PORT,
+    DEFAULT_SSH_PORT,
+};
+
+pub struct AppState {
+    inner: Mutex<InnerState>,
+    storage_path: PathBuf,
+}
+
+#[derive(Default)]
+struct InnerState {
+    devices: HashMap<String, DeviceRecord>,
+    connections: HashMap<String, ConnectionRuntime>,
+}
+
+#[derive(Debug)]
+struct ConnectionRuntime {
+    endpoint: String,
+    local_server: Option<ManagedProcess>,
+    ssh_remote_server: Option<ManagedProcess>,
+    ssh_forwarder: Option<ManagedProcess>,
+}
+
+#[derive(Debug)]
+struct ManagedProcess {
+    role: &'static str,
+    pid: u32,
+    child: Child,
+}
+
+#[derive(Debug, Error)]
+pub enum AppStateError {
+    #[error("device not found: {device_id}")]
+    DeviceNotFound { device_id: String },
+    #[error("state lock poisoned")]
+    StatePoisoned,
+    #[error("failed to allocate a free local port: {source}")]
+    FreePort { source: io::Error },
+    #[error("failed to spawn {role} process `{program}` with args {args:?}: {source}")]
+    SpawnProcess {
+        role: String,
+        program: String,
+        args: Vec<String>,
+        source: io::Error,
+    },
+    #[error("{role} process exited before becoming ready (status: {status})")]
+    ProcessExited { role: String, status: ExitStatus },
+    #[error("failed to inspect {role} process lifecycle: {source}")]
+    ProcessInspect { role: String, source: io::Error },
+    #[error("failed to stop {role} process: {source}")]
+    StopProcess { role: String, source: io::Error },
+    #[error("endpoint did not become ready: {endpoint} within {timeout_ms}ms")]
+    EndpointNotReady { endpoint: String, timeout_ms: u64 },
+    #[error("disconnect had one or more process shutdown errors: {0}")]
+    DisconnectErrors(String),
+    #[error("failed to persist device metadata at {path}: {source}")]
+    PersistDevices { path: String, source: io::Error },
+    #[error("failed to parse persisted device metadata at {path}: {source}")]
+    ParseDevices {
+        path: String,
+        source: serde_json::Error,
+    },
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        let storage_path = device_storage_path();
+        let devices = match load_devices(&storage_path) {
+            Ok(records) => records,
+            Err(error) => {
+                warn!(error = %error, "failed to load persisted device metadata; using empty device list");
+                HashMap::new()
+            }
+        };
+
+        Self {
+            inner: Mutex::new(InnerState {
+                devices,
+                connections: HashMap::new(),
+            }),
+            storage_path,
+        }
+    }
+}
+
+impl AppState {
+    pub fn add_local_device(
+        &self,
+        request: DeviceAddLocalRequest,
+    ) -> Result<DeviceRecord, AppStateError> {
+        let config = LocalDeviceConfig {
+            app_server_port: request.app_server_port,
+            codex_bin: request.codex_bin,
+            workspace_root: request.workspace_root,
+        };
+
+        let display_port = config
+            .app_server_port
+            .map(|port| port.to_string())
+            .unwrap_or_else(|| "auto".to_owned());
+
+        let record = DeviceRecord {
+            id: Uuid::new_v4().to_string(),
+            name: request
+                .name
+                .unwrap_or_else(|| format!("Local ({display_port})")),
+            config: DeviceConfig::Local(config),
+            connected: false,
+            connection: None,
+            last_error: None,
+        };
+
+        {
+            let mut inner = self.lock_inner()?;
+            inner.devices.insert(record.id.clone(), record.clone());
+            self.persist_devices_locked(&inner)?;
+        }
+
+        Ok(record)
+    }
+
+    pub fn add_ssh_device(
+        &self,
+        request: DeviceAddSshRequest,
+    ) -> Result<DeviceRecord, AppStateError> {
+        let config = SshDeviceConfig {
+            host: request.host,
+            user: request.user,
+            ssh_port: request.ssh_port.unwrap_or(DEFAULT_SSH_PORT),
+            identity_file: request.identity_file,
+            remote_app_server_port: request
+                .remote_app_server_port
+                .unwrap_or(DEFAULT_REMOTE_APP_SERVER_PORT),
+            local_forward_port: request.local_forward_port,
+            codex_bin: request.codex_bin,
+            workspace_root: request.workspace_root,
+        };
+
+        let record = DeviceRecord {
+            id: Uuid::new_v4().to_string(),
+            name: request
+                .name
+                .unwrap_or_else(|| format!("{}@{}", config.user, config.host)),
+            config: DeviceConfig::Ssh(config),
+            connected: false,
+            connection: None,
+            last_error: None,
+        };
+
+        {
+            let mut inner = self.lock_inner()?;
+            inner.devices.insert(record.id.clone(), record.clone());
+            self.persist_devices_locked(&inner)?;
+        }
+
+        Ok(record)
+    }
+
+    pub fn list_devices(&self) -> Result<Vec<DeviceRecord>, AppStateError> {
+        let inner = self.lock_inner()?;
+        let mut records = inner.devices.values().cloned().collect::<Vec<_>>();
+        records.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        Ok(records)
+    }
+
+    pub fn remove_device(&self, device_id: &str) -> Result<Vec<DeviceRecord>, AppStateError> {
+        self.disconnect_if_connected(device_id)?;
+
+        {
+            let mut inner = self.lock_inner()?;
+            inner
+                .devices
+                .remove(device_id)
+                .ok_or_else(|| AppStateError::DeviceNotFound {
+                    device_id: device_id.to_owned(),
+                })?;
+            self.persist_devices_locked(&inner)?;
+        }
+
+        self.list_devices()
+    }
+
+    pub fn connect_device(&self, device_id: &str) -> Result<DeviceRecord, AppStateError> {
+        let (device, existing_runtime) = {
+            let mut inner = self.lock_inner()?;
+            let device = inner.devices.get(device_id).cloned().ok_or_else(|| {
+                AppStateError::DeviceNotFound {
+                    device_id: device_id.to_owned(),
+                }
+            })?;
+            let existing_runtime = inner.connections.remove(device_id);
+            (device, existing_runtime)
+        };
+
+        if let Some(runtime) = existing_runtime {
+            runtime.shutdown()?;
+        }
+
+        let runtime = match self.spawn_runtime(&device) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let mut inner = self.lock_inner()?;
+                if let Some(record) = inner.devices.get_mut(device_id) {
+                    record.connected = false;
+                    record.connection = None;
+                    record.last_error = Some(error.to_string());
+                }
+                self.persist_devices_locked(&inner)?;
+                return Err(error);
+            }
+        };
+
+        let mut inner = self.lock_inner()?;
+        let record =
+            inner
+                .devices
+                .get_mut(device_id)
+                .ok_or_else(|| AppStateError::DeviceNotFound {
+                    device_id: device_id.to_owned(),
+                })?;
+
+        record.connected = true;
+        record.connection = Some(runtime.connection_snapshot());
+        record.last_error = None;
+
+        let response = record.clone();
+        inner.connections.insert(device_id.to_owned(), runtime);
+        self.persist_devices_locked(&inner)?;
+
+        info!(device_id, "device connected");
+        Ok(response)
+    }
+
+    pub fn disconnect_device(&self, device_id: &str) -> Result<DeviceRecord, AppStateError> {
+        self.disconnect_if_connected(device_id)?;
+
+        let mut inner = self.lock_inner()?;
+        let response =
+            {
+                let record = inner.devices.get_mut(device_id).ok_or_else(|| {
+                    AppStateError::DeviceNotFound {
+                        device_id: device_id.to_owned(),
+                    }
+                })?;
+                record.connected = false;
+                record.connection = None;
+                record.last_error = None;
+                record.clone()
+            };
+
+        self.persist_devices_locked(&inner)?;
+
+        info!(device_id, "device disconnected");
+        Ok(response)
+    }
+
+    fn disconnect_if_connected(&self, device_id: &str) -> Result<(), AppStateError> {
+        let runtime =
+            {
+                let mut inner = self.lock_inner()?;
+                let record = inner.devices.get_mut(device_id).ok_or_else(|| {
+                    AppStateError::DeviceNotFound {
+                        device_id: device_id.to_owned(),
+                    }
+                })?;
+                record.connected = false;
+                record.connection = None;
+                inner.connections.remove(device_id)
+            };
+
+        if let Some(runtime) = runtime {
+            runtime.shutdown()?;
+        }
+
+        Ok(())
+    }
+
+    fn spawn_runtime(&self, device: &DeviceRecord) -> Result<ConnectionRuntime, AppStateError> {
+        match &device.config {
+            DeviceConfig::Local(config) => spawn_local_runtime(config),
+            DeviceConfig::Ssh(config) => spawn_ssh_runtime(config),
+        }
+    }
+
+    fn persist_devices_locked(&self, inner: &InnerState) -> Result<(), AppStateError> {
+        let mut devices = inner.devices.values().cloned().collect::<Vec<_>>();
+        for device in &mut devices {
+            // Runtime process state is ephemeral and should not survive restarts.
+            device.connected = false;
+            device.connection = None;
+        }
+        devices.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+
+        let payload = PersistedDevices { devices };
+        if let Some(parent) = self.storage_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| AppStateError::PersistDevices {
+                path: parent.display().to_string(),
+                source,
+            })?;
+        }
+
+        let serialized = serde_json::to_string_pretty(&payload).map_err(|source| {
+            AppStateError::ParseDevices {
+                path: self.storage_path.display().to_string(),
+                source,
+            }
+        })?;
+
+        fs::write(&self.storage_path, serialized).map_err(|source| {
+            AppStateError::PersistDevices {
+                path: self.storage_path.display().to_string(),
+                source,
+            }
+        })?;
+
+        Ok(())
+    }
+
+    fn lock_inner(&self) -> Result<MutexGuard<'_, InnerState>, AppStateError> {
+        self.inner.lock().map_err(|_| AppStateError::StatePoisoned)
+    }
+}
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        let runtimes: Vec<ConnectionRuntime> = match self.inner.lock() {
+            Ok(mut inner) => inner
+                .connections
+                .drain()
+                .map(|(_, runtime)| runtime)
+                .collect(),
+            Err(_) => return,
+        };
+
+        for runtime in runtimes {
+            if let Err(error) = runtime.shutdown() {
+                error!(error = %error, "failed to shutdown runtime during application drop");
+            }
+        }
+    }
+}
+
+impl ConnectionRuntime {
+    fn connection_snapshot(&self) -> DeviceConnection {
+        DeviceConnection {
+            endpoint: self.endpoint.clone(),
+            transport: "websocket".to_owned(),
+            connected_at_ms: now_ms(),
+            local_server_pid: self.local_server.as_ref().map(ManagedProcess::pid),
+            ssh_remote_pid: self.ssh_remote_server.as_ref().map(ManagedProcess::pid),
+            ssh_forward_pid: self.ssh_forwarder.as_ref().map(ManagedProcess::pid),
+        }
+    }
+
+    fn shutdown(mut self) -> Result<(), AppStateError> {
+        let mut errors = Vec::new();
+
+        for process in [
+            &mut self.ssh_forwarder,
+            &mut self.ssh_remote_server,
+            &mut self.local_server,
+        ] {
+            if let Some(process) = process.take() {
+                if let Err(err) = process.shutdown() {
+                    errors.push(err.to_string());
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(AppStateError::DisconnectErrors(errors.join("; ")))
+        }
+    }
+}
+
+impl ManagedProcess {
+    fn spawn(
+        role: &'static str,
+        program: &str,
+        args: &[String],
+        current_dir: Option<&Path>,
+    ) -> Result<Self, AppStateError> {
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        if let Some(dir) = current_dir {
+            command.current_dir(dir);
+        }
+
+        let child = command
+            .spawn()
+            .map_err(|source| AppStateError::SpawnProcess {
+                role: role.to_owned(),
+                program: program.to_owned(),
+                args: args.to_vec(),
+                source,
+            })?;
+
+        let pid = child.id();
+        Ok(Self { role, pid, child })
+    }
+
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn assert_running(&mut self) -> Result<(), AppStateError> {
+        if let Some(status) =
+            self.child
+                .try_wait()
+                .map_err(|source| AppStateError::ProcessInspect {
+                    role: self.role.to_owned(),
+                    source,
+                })?
+        {
+            return Err(AppStateError::ProcessExited {
+                role: self.role.to_owned(),
+                status,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn shutdown(mut self) -> Result<(), AppStateError> {
+        if self
+            .child
+            .try_wait()
+            .map_err(|source| AppStateError::ProcessInspect {
+                role: self.role.to_owned(),
+                source,
+            })?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        if let Err(source) = self.child.kill() {
+            if source.kind() != io::ErrorKind::InvalidInput {
+                return Err(AppStateError::StopProcess {
+                    role: self.role.to_owned(),
+                    source,
+                });
+            }
+        }
+
+        let _ = self.child.wait();
+        Ok(())
+    }
+}
+
+fn spawn_local_runtime(config: &LocalDeviceConfig) -> Result<ConnectionRuntime, AppStateError> {
+    let program = config.codex_bin.as_deref().unwrap_or("codex").to_owned();
+    let local_port = config.app_server_port.unwrap_or(allocate_port()?);
+    let endpoint = format!("ws://127.0.0.1:{local_port}");
+
+    let args = vec![
+        "app-server".to_owned(),
+        "--listen".to_owned(),
+        endpoint.clone(),
+    ];
+
+    let mut local_server = ManagedProcess::spawn(
+        "local-app-server",
+        &program,
+        &args,
+        config.workspace_root.as_deref().map(Path::new),
+    )?;
+
+    thread::sleep(Duration::from_millis(450));
+    if let Err(error) = local_server.assert_running() {
+        let _ = local_server.shutdown();
+        return Err(error);
+    }
+    wait_for_endpoint_ready(&endpoint, local_port, Duration::from_secs(10))?;
+
+    Ok(ConnectionRuntime {
+        endpoint,
+        local_server: Some(local_server),
+        ssh_remote_server: None,
+        ssh_forwarder: None,
+    })
+}
+
+fn spawn_ssh_runtime(config: &SshDeviceConfig) -> Result<ConnectionRuntime, AppStateError> {
+    let target = format!("{}@{}", config.user, config.host);
+
+    let remote_port = config.remote_app_server_port;
+    let local_forward_port = config.local_forward_port.unwrap_or(allocate_port()?);
+
+    let listen_uri = format!("ws://127.0.0.1:{remote_port}");
+    let quoted_listen_uri = quote_shell(&listen_uri);
+    let app_server_cmd = if let Some(codex_bin) = config.codex_bin.as_deref() {
+        let codex_dir = Path::new(codex_bin)
+            .parent()
+            .and_then(Path::to_str)
+            .map(str::to_owned);
+        if let Some(dir) = codex_dir {
+            format!(
+                "PATH={}:$PATH {} app-server --listen {}",
+                quote_shell(&dir),
+                quote_shell(codex_bin),
+                quoted_listen_uri
+            )
+        } else {
+            format!(
+                "{} app-server --listen {}",
+                quote_shell(codex_bin),
+                quoted_listen_uri
+            )
+        }
+    } else {
+        format!(
+            "if command -v codex >/dev/null 2>&1; then codex app-server --listen {listen}; \
+elif [ -s \"$HOME/.nvm/nvm.sh\" ]; then . \"$HOME/.nvm/nvm.sh\" >/dev/null 2>&1 && codex app-server --listen {listen}; \
+else codex app-server --listen {listen}; fi",
+            listen = quoted_listen_uri
+        )
+    };
+
+    let remote_cmd = if let Some(root) = &config.workspace_root {
+        format!(
+            "cd {} && {}",
+            quote_shell(root),
+            app_server_cmd
+        )
+    } else {
+        app_server_cmd
+    };
+
+    let mut remote_args = ssh_base_args(config);
+    remote_args.push(target.clone());
+    remote_args.push(format!("bash -lc {}", quote_shell(&remote_cmd)));
+
+    let mut ssh_remote_server =
+        ManagedProcess::spawn("ssh-remote-app-server", "ssh", &remote_args, None)?;
+
+    thread::sleep(Duration::from_millis(350));
+    if let Err(error) = ssh_remote_server.assert_running() {
+        let _ = ssh_remote_server.shutdown();
+        return Err(error);
+    }
+
+    let mut forward_args = ssh_base_args(config);
+    forward_args.push("-N".to_owned());
+    forward_args.push("-o".to_owned());
+    forward_args.push("ExitOnForwardFailure=yes".to_owned());
+    forward_args.push("-L".to_owned());
+    forward_args.push(format!("{local_forward_port}:127.0.0.1:{remote_port}"));
+    forward_args.push(target);
+
+    let mut ssh_forwarder = match ManagedProcess::spawn("ssh-forwarder", "ssh", &forward_args, None)
+    {
+        Ok(process) => process,
+        Err(error) => {
+            let _ = ssh_remote_server.shutdown();
+            return Err(error);
+        }
+    };
+
+    thread::sleep(Duration::from_millis(450));
+    if let Err(error) = ssh_forwarder.assert_running() {
+        let _ = ssh_forwarder.shutdown();
+        let _ = ssh_remote_server.shutdown();
+        return Err(error);
+    }
+    let endpoint = format!("ws://127.0.0.1:{local_forward_port}");
+    if let Err(error) = wait_for_endpoint_ready(&endpoint, local_forward_port, Duration::from_secs(12))
+    {
+        let _ = ssh_forwarder.shutdown();
+        let _ = ssh_remote_server.shutdown();
+        return Err(error);
+    }
+
+    Ok(ConnectionRuntime {
+        endpoint,
+        local_server: None,
+        ssh_remote_server: Some(ssh_remote_server),
+        ssh_forwarder: Some(ssh_forwarder),
+    })
+}
+
+fn ssh_base_args(config: &SshDeviceConfig) -> Vec<String> {
+    let mut args = vec![
+        "-p".to_owned(),
+        config.ssh_port.to_string(),
+        "-o".to_owned(),
+        "BatchMode=yes".to_owned(),
+        "-o".to_owned(),
+        "ServerAliveInterval=15".to_owned(),
+        "-o".to_owned(),
+        "ServerAliveCountMax=3".to_owned(),
+    ];
+
+    if let Some(identity_file) = &config.identity_file {
+        args.push("-i".to_owned());
+        args.push(identity_file.clone());
+    }
+
+    args
+}
+
+fn allocate_port() -> Result<u16, AppStateError> {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").map_err(|source| AppStateError::FreePort { source })?;
+    let port = listener
+        .local_addr()
+        .map_err(|source| AppStateError::FreePort { source })?
+        .port();
+    drop(listener);
+    Ok(port)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn wait_for_endpoint_ready(
+    endpoint: &str,
+    local_port: u16,
+    timeout: Duration,
+) -> Result<(), AppStateError> {
+    let deadline = Instant::now() + timeout;
+    let address = SocketAddr::from(([127, 0, 0, 1], local_port));
+    loop {
+        if TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok() {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(AppStateError::EndpointNotReady {
+                endpoint: endpoint.to_owned(),
+                timeout_ms: timeout.as_millis() as u64,
+            });
+        }
+
+        thread::sleep(Duration::from_millis(180));
+    }
+}
+
+fn device_storage_path() -> PathBuf {
+    let base_dir = dirs::data_local_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base_dir.join("codex-session-monitor").join("devices.json")
+}
+
+fn load_devices(path: &Path) -> Result<HashMap<String, DeviceRecord>, AppStateError> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let content = fs::read_to_string(path).map_err(|source| AppStateError::PersistDevices {
+        path: path.display().to_string(),
+        source,
+    })?;
+
+    let mut payload = serde_json::from_str::<PersistedDevices>(&content).map_err(|source| {
+        AppStateError::ParseDevices {
+            path: path.display().to_string(),
+            source,
+        }
+    })?;
+
+    let mut records = HashMap::new();
+    for mut record in payload.devices.drain(..) {
+        record.connected = false;
+        record.connection = None;
+        record.last_error = None;
+        records.insert(record.id.clone(), record);
+    }
+
+    Ok(records)
+}
+
+fn quote_shell(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_owned();
+    }
+
+    let escaped = value.replace('\'', "'\\''");
+    format!("'{escaped}'")
+}
