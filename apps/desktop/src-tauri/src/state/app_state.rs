@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -587,8 +587,13 @@ else codex app-server --listen {listen}; fi",
         return Err(error);
     }
     let endpoint = format!("ws://127.0.0.1:{local_forward_port}");
-    if let Err(error) = wait_for_endpoint_ready(&endpoint, local_forward_port, Duration::from_secs(12))
-    {
+    if let Err(error) = wait_for_ssh_endpoint_ready(
+        &endpoint,
+        local_forward_port,
+        Duration::from_secs(30),
+        &mut ssh_remote_server,
+        &mut ssh_forwarder,
+    ) {
         let _ = ssh_forwarder.shutdown();
         let _ = ssh_remote_server.shutdown();
         return Err(error);
@@ -648,7 +653,7 @@ fn wait_for_endpoint_ready(
     let deadline = Instant::now() + timeout;
     let address = SocketAddr::from(([127, 0, 0, 1], local_port));
     loop {
-        if TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok() {
+        if websocket_upgrade_succeeds(address, local_port) {
             return Ok(());
         }
 
@@ -661,6 +666,63 @@ fn wait_for_endpoint_ready(
 
         thread::sleep(Duration::from_millis(180));
     }
+}
+
+fn wait_for_ssh_endpoint_ready(
+    endpoint: &str,
+    local_port: u16,
+    timeout: Duration,
+    remote_process: &mut ManagedProcess,
+    forward_process: &mut ManagedProcess,
+) -> Result<(), AppStateError> {
+    let deadline = Instant::now() + timeout;
+    let address = SocketAddr::from(([127, 0, 0, 1], local_port));
+    loop {
+        if websocket_upgrade_succeeds(address, local_port) {
+            return Ok(());
+        }
+
+        // If either SSH process exits while waiting, surface that precise cause
+        // instead of a generic endpoint timeout.
+        remote_process.assert_running()?;
+        forward_process.assert_running()?;
+
+        if Instant::now() >= deadline {
+            return Err(AppStateError::EndpointNotReady {
+                endpoint: endpoint.to_owned(),
+                timeout_ms: timeout.as_millis() as u64,
+            });
+        }
+
+        thread::sleep(Duration::from_millis(180));
+    }
+}
+
+fn websocket_upgrade_succeeds(address: SocketAddr, local_port: u16) -> bool {
+    let mut stream = match TcpStream::connect_timeout(&address, Duration::from_millis(1500)) {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(1500)));
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
+
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: 127.0.0.1:{local_port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+
+    let mut buffer = [0_u8; 2048];
+    let read = match stream.read(&mut buffer) {
+        Ok(read) if read > 0 => read,
+        _ => return false,
+    };
+
+    let response = String::from_utf8_lossy(&buffer[..read]);
+    response.starts_with("HTTP/1.1 101") || response.contains(" 101 ")
 }
 
 fn device_storage_path() -> PathBuf {
