@@ -18,6 +18,7 @@ export default function App() {
   const activePointerIdRef = useRef<number | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(360);
   const [resizingSidebar, setResizingSidebar] = useState(false);
+  const [composerFocusToken, setComposerFocusToken] = useState(0);
 
   const loading = useAppStore((state) => state.loading);
   const devices = useAppStore((state) => state.devices);
@@ -31,11 +32,15 @@ export default function App() {
   const selectSession = useAppStore((state) => state.selectSession);
   const submitComposer = useAppStore((state) => state.submitComposer);
   const addSsh = useAppStore((state) => state.addSsh);
+  const browseDeviceDirectories = useAppStore(
+    (state) => state.browseDeviceDirectories
+  );
   const connect = useAppStore((state) => state.connect);
   const disconnect = useAppStore((state) => state.disconnect);
   const remove = useAppStore((state) => state.remove);
   const refreshDeviceSessions = useAppStore((state) => state.refreshDeviceSessions);
   const refreshSessions = useAppStore((state) => state.refreshSessions);
+  const startNewSession = useAppStore((state) => state.startNewSession);
 
   useEffect(() => {
     void initialize();
@@ -128,6 +133,15 @@ export default function App() {
           onRefreshDevice={(deviceId) => {
             void refreshDeviceSessions(deviceId);
           }}
+          onBrowseDirectories={(deviceId, cwd) =>
+            browseDeviceDirectories(deviceId, cwd)
+          }
+          onStartNewSession={async (deviceId, cwd) => {
+            const sessionKey = await startNewSession({ deviceId, cwd });
+            if (sessionKey) {
+              setComposerFocusToken((previous) => previous + 1);
+            }
+          }}
         />
       </div>
 
@@ -164,6 +178,7 @@ export default function App() {
         <Composer
           sessionKey={selectedSessionKey}
           disabled={loading || selectedSessionKey === null}
+          focusToken={composerFocusToken}
           onSubmit={submitComposer}
         />
       </main>

@@ -202,6 +202,90 @@
   font-size: 0.74rem;
 }
 
+.sidebar__new-session {
+  margin: 0.2rem 0 0.55rem;
+  padding: 0.5rem;
+  border: 1px solid color-mix(in srgb, var(--line) 88%, transparent);
+  border-radius: 9px;
+  background: rgba(11, 17, 26, 0.7);
+  display: grid;
+  gap: 0.38rem;
+}
+
+.sidebar__new-session-label {
+  font-size: 0.71rem;
+  color: color-mix(in srgb, var(--text-muted) 90%, #dbe8ff);
+}
+
+.sidebar__new-session-path-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 0.32rem;
+}
+
+.sidebar__new-session-path-row input {
+  border: 1px solid color-mix(in srgb, var(--line) 92%, transparent);
+  border-radius: 7px;
+  background: rgba(7, 11, 16, 0.95);
+  color: var(--text-main);
+  padding: 0.3rem 0.42rem;
+  font-size: 0.72rem;
+  min-width: 0;
+}
+
+.sidebar__new-session-path-row button {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgba(9, 13, 18, 0.88);
+  color: var(--text-main);
+  font-size: 0.7rem;
+  padding: 0.26rem 0.4rem;
+  cursor: pointer;
+}
+
+.sidebar__new-session-path-row button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.sidebar__new-session-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.24rem;
+  max-height: 9.5rem;
+  overflow: auto;
+}
+
+.sidebar__new-session-list li button {
+  width: 100%;
+  text-align: left;
+  border: 1px solid color-mix(in srgb, var(--line) 88%, transparent);
+  border-radius: 7px;
+  background: rgba(8, 12, 18, 0.8);
+  color: color-mix(in srgb, var(--text-main) 92%, #eef6ff);
+  font-size: 0.7rem;
+  padding: 0.26rem 0.42rem;
+  cursor: pointer;
+}
+
+.sidebar__new-session-list li button:hover {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--line));
+}
+
+.sidebar__new-session-status {
+  margin: 0;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.sidebar__new-session-error {
+  margin: 0;
+  font-size: 0.71rem;
+  color: #ffc8c8;
+}
+
 .status-pill {
   border-radius: 999px;
   padding: 0.2rem 0.5rem;
@@ -652,5 +736,9 @@
 
   .sidebar__device-actions {
     flex-wrap: wrap;
+  }
+
+  .sidebar__new-session-path-row {
+    grid-template-columns: 1fr;
   }
 }

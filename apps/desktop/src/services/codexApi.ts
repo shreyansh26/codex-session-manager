@@ -4,6 +4,8 @@ import type {
   ChatMessage,
   ChatRole,
   ComposerSubmission,
+  DirectoryBrowseResult,
+  DirectoryEntry,
   DeviceRecord,
   RpcNotification,
   SessionSummary,
@@ -225,7 +227,75 @@ export const resumeThread = async (
   threadId: string
 ): Promise<void> => {
   const client = await ensureInitialized(device);
-  await callWithFallback(client, "thread/resume", [{ threadId }, { id: threadId }]);
+  await callWithFallback(client, "thread/resume", [{ threadId }]);
+};
+
+export const startThread = async (
+  device: DeviceRecord,
+  cwd: string
+): Promise<{ threadId: string; cwd: string }> => {
+  const client = await ensureInitialized(device);
+  const normalizedCwd = normalizePosixPath(cwd);
+  const result = await callWithFallback(client, "thread/start", [
+    {
+      cwd: normalizedCwd,
+      experimentalRawEvents: false,
+      persistExtendedHistory: true
+    },
+    { cwd: normalizedCwd }
+  ]);
+
+  const record = asRecord(result);
+  const thread = asRecord(record?.thread);
+  const threadId =
+    pickString(thread, ["id", "threadId", "thread_id"]) ??
+    pickString(record, ["threadId", "thread_id", "id"]);
+  if (!threadId) {
+    throw new Error("Failed to create a new session: missing thread id.");
+  }
+
+  const resolvedCwd =
+    pickString(record, ["cwd", "workingDirectory", "working_directory"]) ??
+    pickString(thread, ["cwd", "workingDirectory", "working_directory"]) ??
+    normalizedCwd;
+
+  return {
+    threadId,
+    cwd: normalizePosixPath(resolvedCwd)
+  };
+};
+
+export const listDirectories = async (
+  device: DeviceRecord,
+  cwd: string
+): Promise<DirectoryBrowseResult> => {
+  const client = await ensureInitialized(device);
+  const normalizedCwd = normalizePosixPath(cwd);
+  const result = await client.call<unknown>("command/exec", {
+    command: ["ls", "-1A", "-p"],
+    cwd: normalizedCwd
+  });
+
+  const response = asRecord(result);
+  const exitCodeRaw = response?.exitCode ?? response?.exit_code;
+  const exitCode =
+    typeof exitCodeRaw === "number"
+      ? exitCodeRaw
+      : typeof exitCodeRaw === "string"
+        ? Number.parseInt(exitCodeRaw, 10)
+        : 0;
+  const stdout = typeof response?.stdout === "string" ? response.stdout : "";
+  const stderr = typeof response?.stderr === "string" ? response.stderr : "";
+
+  if (!Number.isFinite(exitCode) || exitCode !== 0) {
+    const reason = stderr.trim() || `Unable to list directories at ${normalizedCwd}.`;
+    throw new Error(reason);
+  }
+
+  return {
+    cwd: normalizedCwd,
+    entries: parseLsDirectoryEntries(stdout, normalizedCwd)
+  };
 };
 
 export const startTurn = async (
@@ -258,14 +328,11 @@ export const buildTurnStartAttempts = (
   const attempts: Array<Record<string, unknown>> = [];
   for (const input of sequenceShapes) {
     attempts.push({ threadId, input });
-    attempts.push({ thread_id: threadId, input });
   }
 
   // Keep legacy fallbacks for older app-server variants.
   if (!hasImages && normalizedPrompt.length > 0) {
     attempts.push({ threadId, input: normalizedPrompt });
-    attempts.push({ thread_id: threadId, input: normalizedPrompt });
-    attempts.push({ input: normalizedPrompt });
   }
 
   return attempts;
@@ -885,6 +952,114 @@ const truncateForTitle = (value: string): string => {
 
 const formatSessionTitle = (baseTitle: string, threadId: string): string =>
   `${baseTitle || threadId} (${threadId})`;
+
+export const normalizePosixPath = (value: string): string => {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return ".";
+  }
+
+  const normalizedSeparators = trimmed.replace(/\\/g, "/");
+  const isAbsolute = normalizedSeparators.startsWith("/");
+  const parts = normalizedSeparators.split("/");
+  const stack: string[] = [];
+
+  for (const part of parts) {
+    if (!part || part === ".") {
+      continue;
+    }
+    if (part === "..") {
+      if (stack.length > 0 && stack[stack.length - 1] !== "..") {
+        stack.pop();
+      } else if (!isAbsolute) {
+        stack.push("..");
+      }
+      continue;
+    }
+    stack.push(part);
+  }
+
+  if (isAbsolute) {
+    return stack.length === 0 ? "/" : `/${stack.join("/")}`;
+  }
+
+  if (stack.length === 0) {
+    return ".";
+  }
+
+  return stack.join("/");
+};
+
+export const joinPosixPath = (base: string, child: string): string => {
+  if (child.trim().startsWith("/")) {
+    return normalizePosixPath(child);
+  }
+
+  const normalizedBase = normalizePosixPath(base);
+  if (normalizedBase === "/") {
+    return normalizePosixPath(`/${child}`);
+  }
+  if (normalizedBase === ".") {
+    return normalizePosixPath(child);
+  }
+  return normalizePosixPath(`${normalizedBase}/${child}`);
+};
+
+export const parentPosixPath = (value: string): string => {
+  const normalized = normalizePosixPath(value);
+  if (normalized === "/") {
+    return "/";
+  }
+  if (normalized === "." || normalized === "..") {
+    return normalized;
+  }
+
+  const parts = normalized.split("/");
+  parts.pop();
+
+  if (normalized.startsWith("/")) {
+    const joined = parts.filter((segment) => segment.length > 0).join("/");
+    return joined.length === 0 ? "/" : `/${joined}`;
+  }
+
+  const joined = parts.filter((segment) => segment.length > 0).join("/");
+  return joined.length === 0 ? "." : joined;
+};
+
+export const parseLsDirectoryEntries = (
+  stdout: string,
+  cwd: string
+): DirectoryEntry[] => {
+  const normalizedCwd = normalizePosixPath(cwd);
+  const parent = parentPosixPath(normalizedCwd);
+  const entries: DirectoryEntry[] = [];
+
+  if (normalizedCwd !== "/" && parent !== normalizedCwd) {
+    entries.push({
+      kind: "parent",
+      name: "..",
+      path: parent
+    });
+  }
+
+  const directories = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && line.endsWith("/"))
+    .map((line) => line.replace(/\/+$/, ""))
+    .filter((line) => line.length > 0 && line !== "." && line !== "..")
+    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+
+  for (const directoryName of directories) {
+    entries.push({
+      kind: "directory",
+      name: directoryName,
+      path: joinPosixPath(normalizedCwd, directoryName)
+    });
+  }
+
+  return entries;
+};
 
 const folderNameFromPath = (value: string | null): string | null => {
   if (!value) {

@@ -83,6 +83,22 @@ export interface ThreadPayload {
   messages: ChatMessage[];
 }
 
+export interface DirectoryEntry {
+  name: string;
+  path: string;
+  kind: "parent" | "directory";
+}
+
+export interface DirectoryBrowseResult {
+  cwd: string;
+  entries: DirectoryEntry[];
+}
+
+export interface NewSessionRequest {
+  deviceId: string;
+  cwd: string;
+}
+
 export interface DeviceAddLocalRequest {
   name?: string;
   appServerPort?: number;

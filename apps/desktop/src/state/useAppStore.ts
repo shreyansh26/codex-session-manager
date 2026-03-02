@@ -3,19 +3,23 @@ import { makeSessionKey } from "../domain/sessionKey";
 import type {
   ChatMessage,
   ComposerSubmission,
+  DirectoryBrowseResult,
   DeviceAddSshRequest,
   DeviceRecord,
+  NewSessionRequest,
   RpcNotification,
   SessionSummary
 } from "../domain/types";
 import {
   closeAllClients,
   closeDeviceClient,
+  listDirectories,
   listThreads,
   readAccount,
   readThread,
   resumeThread,
   setNotificationSink,
+  startThread,
   startTurn
 } from "../services/codexApi";
 import { parseRpcNotification } from "../services/eventParser";
@@ -46,6 +50,11 @@ interface AppStore {
     threadId: string,
     options?: { preserveSummary?: boolean; skipMessages?: boolean }
   ) => Promise<void>;
+  browseDeviceDirectories: (
+    deviceId: string,
+    cwd: string
+  ) => Promise<DirectoryBrowseResult>;
+  startNewSession: (request: NewSessionRequest) => Promise<string | null>;
   submitComposer: (submission: ComposerSubmission) => Promise<void>;
   addSsh: (request: DeviceAddSshRequest) => Promise<void>;
   connect: (deviceId: string) => Promise<void>;
@@ -436,6 +445,11 @@ const findLocalDevice = (devices: DeviceRecord[]): DeviceRecord | null =>
 
 const isValidIsoTimestamp = (value: string): boolean =>
   !Number.isNaN(Date.parse(value));
+
+const shouldIgnoreResumeError = (error: unknown): boolean => {
+  const message = toErrorMessage(error).toLowerCase();
+  return message.includes("no rollout found for thread id");
+};
 
 const sessionsEqual = (
   current: SessionSummary[],
@@ -869,8 +883,9 @@ export const useAppStore = create<AppStore>((set, get) => {
 
       const previousState = get();
       const incomingKeys = new Set(sessionBuckets.map((session) => session.key));
+      const selectedKey = previousState.selectedSessionKey;
       const preserved = previousState.sessions.filter((session) =>
-        incomingKeys.has(session.key)
+        incomingKeys.has(session.key) || session.key === selectedKey
       );
       const sessions = mergeSessions(preserved, sessionBuckets);
       const selectedSessionKey = pickSelectedSession(
@@ -918,8 +933,11 @@ export const useAppStore = create<AppStore>((set, get) => {
           const otherDevices = state.sessions.filter(
             (session) => session.deviceId !== deviceId
           );
+          const selectedKey = state.selectedSessionKey;
           const preservedForDevice = state.sessions.filter(
-            (session) => session.deviceId === deviceId && incomingKeys.has(session.key)
+            (session) =>
+              session.deviceId === deviceId &&
+              (incomingKeys.has(session.key) || session.key === selectedKey)
           );
           const mergedSessions = mergeSessions(
             [...otherDevices, ...preservedForDevice],
@@ -991,6 +1009,38 @@ export const useAppStore = create<AppStore>((set, get) => {
         set({ globalError: toErrorMessage(error) });
       }
     },
+    browseDeviceDirectories: async (deviceId, cwd) => {
+      const device = get().devices.find((entry) => entry.id === deviceId);
+      if (!device || !device.connected) {
+        throw new Error(`Device ${deviceId} is not connected.`);
+      }
+
+      return listDirectories(device, cwd);
+    },
+    startNewSession: async ({ deviceId, cwd }) => {
+      const device = get().devices.find((entry) => entry.id === deviceId);
+      if (!device || !device.connected) {
+        throw new Error(`Device ${deviceId} is not connected.`);
+      }
+
+      const started = await startThread(device, cwd);
+      const payload = await readThread(device, started.threadId);
+
+      set((state) => ({
+        sessions: mergeSessions(state.sessions, [payload.session]),
+        selectedSessionKey: payload.session.key,
+        messagesBySession: {
+          ...state.messagesBySession,
+          [payload.session.key]: mergeThreadMessages(
+            state.messagesBySession[payload.session.key] ?? [],
+            payload.messages
+          )
+        },
+        globalError: null
+      }));
+
+      return payload.session.key;
+    },
     submitComposer: async (submissionInput) => {
       const state = get();
       const session = state.sessions.find(
@@ -999,6 +1049,14 @@ export const useAppStore = create<AppStore>((set, get) => {
       const prompt = submissionInput.prompt.trim();
       const images = normalizeSubmissionImages(submissionInput.images);
       if (!session || (prompt.length === 0 && images.length === 0)) {
+        return;
+      }
+
+      const threadId = session.threadId.trim();
+      if (threadId.length === 0) {
+        set({
+          globalError: "Cannot send message: session is missing a thread id."
+        });
         return;
       }
 
@@ -1013,7 +1071,7 @@ export const useAppStore = create<AppStore>((set, get) => {
       const optimisticUserMessage: ChatMessage = {
         id: `local-${Date.now().toString(36)}`,
         key: session.key,
-        threadId: session.threadId,
+        threadId,
         deviceId: session.deviceId,
         role: "user",
         content: prompt,
@@ -1035,13 +1093,20 @@ export const useAppStore = create<AppStore>((set, get) => {
       startPostSendRefreshBurst({
         sessionKey: session.key,
         deviceId: session.deviceId,
-        threadId: session.threadId
+        threadId
       });
 
       void (async () => {
         try {
-          await resumeThread(device, session.threadId);
-          await startTurn(device, session.threadId, {
+          try {
+            await resumeThread(device, threadId);
+          } catch (error) {
+            if (!shouldIgnoreResumeError(error)) {
+              throw error;
+            }
+          }
+
+          await startTurn(device, threadId, {
             prompt,
             images
           });
@@ -1080,6 +1145,11 @@ export const useAppStore = create<AppStore>((set, get) => {
     },
     disconnect: async (deviceId) => {
       try {
+        const device = get().devices.find((entry) => entry.id === deviceId);
+        if (!device || device.config.kind === "local") {
+          return;
+        }
+
         stopPostSendRefreshesForDevice(deviceId);
         clearReasoningBuffersForDevice(deviceId);
         const disconnected = await disconnectDevice(deviceId);
@@ -1093,6 +1163,11 @@ export const useAppStore = create<AppStore>((set, get) => {
     },
     remove: async (deviceId) => {
       try {
+        const device = get().devices.find((entry) => entry.id === deviceId);
+        if (!device || device.config.kind === "local") {
+          return;
+        }
+
         stopPostSendRefreshesForDevice(deviceId);
         clearReasoningBuffersForDevice(deviceId);
         const devices = await removeDevice(deviceId);

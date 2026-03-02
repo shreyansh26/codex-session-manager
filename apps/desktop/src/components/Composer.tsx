@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   ClipboardEvent as ReactClipboardEvent,
   FormEvent,
@@ -9,6 +9,7 @@ import type { ChatImageAttachment, ComposerSubmission } from "../domain/types";
 interface ComposerProps {
   sessionKey: string | null;
   disabled: boolean;
+  focusToken?: number;
   onSubmit: (submission: ComposerSubmission) => Promise<void> | void;
 }
 
@@ -64,15 +65,25 @@ const formatSize = (sizeBytes?: number): string => {
 export default function Composer({
   sessionKey,
   disabled,
+  focusToken = 0,
   onSubmit
 }: ComposerProps) {
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState<ChatImageAttachment[]>([]);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     setDraft("");
     setAttachments([]);
   }, [sessionKey]);
+
+  useEffect(() => {
+    if (disabled) {
+      return;
+    }
+
+    textareaRef.current?.focus();
+  }, [disabled, focusToken]);
 
   const submitCurrent = () => {
     const prompt = draft.trim();
@@ -179,6 +190,7 @@ export default function Composer({
         </ul>
       ) : null}
       <textarea
+        ref={textareaRef}
         value={draft}
         disabled={disabled}
         onChange={(event) => setDraft(event.target.value)}
