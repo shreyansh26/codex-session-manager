@@ -4,8 +4,11 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "icon:generate": "tauri icon src-tauri/icons/app-icon.png --output src-tauri/icons",
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "dev:tauri:prepare": "npm run icon:generate && npm run dev",
+    "build:tauri:prepare": "npm run icon:generate && npm run build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
