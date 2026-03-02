@@ -509,10 +509,62 @@ fn spawn_ssh_runtime(config: &SshDeviceConfig) -> Result<ConnectionRuntime, AppS
 
     let remote_port = config.remote_app_server_port;
     let local_forward_port = config.local_forward_port.unwrap_or(allocate_port()?);
+    let endpoint = format!("ws://127.0.0.1:{local_forward_port}");
+
+    let mut forward_args = ssh_base_args(config);
+    forward_args.push("-N".to_owned());
+    forward_args.push("-o".to_owned());
+    forward_args.push("ExitOnForwardFailure=yes".to_owned());
+    forward_args.push("-L".to_owned());
+    forward_args.push(format!("{local_forward_port}:127.0.0.1:{remote_port}"));
+    forward_args.push(target.clone());
+
+    let mut ssh_forwarder = match ManagedProcess::spawn("ssh-forwarder", "ssh", &forward_args, None)
+    {
+        Ok(process) => process,
+        Err(error) => return Err(error),
+    };
+
+    thread::sleep(Duration::from_millis(450));
+    if let Err(error) = ssh_forwarder.assert_running() {
+        let _ = ssh_forwarder.shutdown();
+        return Err(error);
+    }
+
+    // Reuse an already-running remote app-server when the forwarded endpoint
+    // is immediately websocket-ready; this prevents duplicate launch attempts
+    // and avoids address-in-use failures on reconnect.
+    match wait_for_ssh_endpoint_ready(
+        &endpoint,
+        local_forward_port,
+        Duration::from_secs(4),
+        None,
+        &mut ssh_forwarder,
+    ) {
+        Ok(()) => {
+            info!(
+                target,
+                endpoint, "reusing existing remote app-server over ssh forward"
+            );
+            return Ok(ConnectionRuntime {
+                endpoint,
+                local_server: None,
+                ssh_remote_server: None,
+                ssh_forwarder: Some(ssh_forwarder),
+            });
+        }
+        Err(AppStateError::EndpointNotReady { .. }) => {
+            // Fall through to launching a remote app-server.
+        }
+        Err(error) => {
+            let _ = ssh_forwarder.shutdown();
+            return Err(error);
+        }
+    }
 
     let listen_uri = format!("ws://127.0.0.1:{remote_port}");
     let quoted_listen_uri = quote_shell(&listen_uri);
-    let app_server_cmd = if let Some(codex_bin) = config.codex_bin.as_deref() {
+    let launch_cmd = if let Some(codex_bin) = config.codex_bin.as_deref() {
         let codex_dir = Path::new(codex_bin)
             .parent()
             .and_then(Path::to_str)
@@ -539,13 +591,19 @@ else codex app-server --listen {listen}; fi",
             listen = quoted_listen_uri
         )
     };
+    let stale_cleanup_cmd = format!(
+        "for pid in $(ss -ltnp 2>/dev/null | sed -n 's/.*127\\\\.0\\\\.0\\\\.1:{port}.*pid=\\\\([0-9]\\\\+\\\\).*/\\\\1/p' | sort -u); do \
+cmd=$(ps -p \"$pid\" -o args= 2>/dev/null || true); \
+case \"$cmd\" in *codex*) kill \"$pid\" >/dev/null 2>&1 || true ;; esac; \
+done",
+        port = remote_port
+    );
+    // On fallback launch after a failed readiness probe, clear stale codex listeners
+    // bound to the target port so reconnect can recover without manual remote cleanup.
+    let app_server_cmd = format!("{stale_cleanup_cmd}; {launch_cmd}");
 
     let remote_cmd = if let Some(root) = &config.workspace_root {
-        format!(
-            "cd {} && {}",
-            quote_shell(root),
-            app_server_cmd
-        )
+        format!("cd {} && {}", quote_shell(root), app_server_cmd)
     } else {
         app_server_cmd
     };
@@ -560,44 +618,26 @@ else codex app-server --listen {listen}; fi",
     thread::sleep(Duration::from_millis(350));
     if let Err(error) = ssh_remote_server.assert_running() {
         let _ = ssh_remote_server.shutdown();
-        return Err(error);
-    }
-
-    let mut forward_args = ssh_base_args(config);
-    forward_args.push("-N".to_owned());
-    forward_args.push("-o".to_owned());
-    forward_args.push("ExitOnForwardFailure=yes".to_owned());
-    forward_args.push("-L".to_owned());
-    forward_args.push(format!("{local_forward_port}:127.0.0.1:{remote_port}"));
-    forward_args.push(target);
-
-    let mut ssh_forwarder = match ManagedProcess::spawn("ssh-forwarder", "ssh", &forward_args, None)
-    {
-        Ok(process) => process,
-        Err(error) => {
-            let _ = ssh_remote_server.shutdown();
-            return Err(error);
-        }
-    };
-
-    thread::sleep(Duration::from_millis(450));
-    if let Err(error) = ssh_forwarder.assert_running() {
         let _ = ssh_forwarder.shutdown();
-        let _ = ssh_remote_server.shutdown();
         return Err(error);
     }
-    let endpoint = format!("ws://127.0.0.1:{local_forward_port}");
+
     if let Err(error) = wait_for_ssh_endpoint_ready(
         &endpoint,
         local_forward_port,
         Duration::from_secs(30),
-        &mut ssh_remote_server,
+        Some(&mut ssh_remote_server),
         &mut ssh_forwarder,
     ) {
         let _ = ssh_forwarder.shutdown();
         let _ = ssh_remote_server.shutdown();
         return Err(error);
     }
+
+    info!(
+        target,
+        endpoint, "launched remote app-server and established ssh forward"
+    );
 
     Ok(ConnectionRuntime {
         endpoint,
@@ -672,11 +712,12 @@ fn wait_for_ssh_endpoint_ready(
     endpoint: &str,
     local_port: u16,
     timeout: Duration,
-    remote_process: &mut ManagedProcess,
+    remote_process: Option<&mut ManagedProcess>,
     forward_process: &mut ManagedProcess,
 ) -> Result<(), AppStateError> {
     let deadline = Instant::now() + timeout;
     let address = SocketAddr::from(([127, 0, 0, 1], local_port));
+    let mut remote_process = remote_process;
     loop {
         if websocket_upgrade_succeeds(address, local_port) {
             return Ok(());
@@ -684,8 +725,10 @@ fn wait_for_ssh_endpoint_ready(
 
         // If either SSH process exits while waiting, surface that precise cause
         // instead of a generic endpoint timeout.
-        remote_process.assert_running()?;
         forward_process.assert_running()?;
+        if let Some(process) = remote_process.as_deref_mut() {
+            process.assert_running()?;
+        }
 
         if Instant::now() >= deadline {
             return Err(AppStateError::EndpointNotReady {
