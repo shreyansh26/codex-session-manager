@@ -2,6 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import ChatPanel from "./components/ChatPanel";
 import Composer from "./components/Composer";
 import Sidebar from "./components/Sidebar";
+import {
+  MODEL_CATALOG,
+  getSupportedThinkingEfforts,
+  getThinkingEffortLabel,
+  resolveComposerModel,
+  resolveSupportedModelId,
+  resolveThinkingEffortForModel
+} from "./domain/modelCatalog";
 import type { SessionCostDisplay } from "./domain/types";
 import { shutdownRpcClients, useAppStore } from "./state/useAppStore";
 
@@ -54,6 +62,8 @@ export default function App() {
   const tokenUsageBySession = useAppStore((state) => state.tokenUsageBySession);
   const modelBySession = useAppStore((state) => state.modelBySession);
   const costUsdBySession = useAppStore((state) => state.costUsdBySession);
+  const availableModelsByDevice = useAppStore((state) => state.availableModelsByDevice);
+  const composerPrefsBySession = useAppStore((state) => state.composerPrefsBySession);
   const globalError = useAppStore((state) => state.globalError);
 
   const initialize = useAppStore((state) => state.initialize);
@@ -70,6 +80,10 @@ export default function App() {
   const refreshDeviceSessions = useAppStore((state) => state.refreshDeviceSessions);
   const refreshSessions = useAppStore((state) => state.refreshSessions);
   const startNewSession = useAppStore((state) => state.startNewSession);
+  const setComposerModel = useAppStore((state) => state.setComposerModel);
+  const setComposerThinkingEffort = useAppStore(
+    (state) => state.setComposerThinkingEffort
+  );
 
   useEffect(() => {
     void initialize();
@@ -162,6 +176,56 @@ export default function App() {
     costUsdBySession
   ]);
 
+  const composerSelection = useMemo(() => {
+    if (!selectedSessionKey) {
+      const fallbackModel = resolveComposerModel(undefined);
+      return {
+        model: fallbackModel,
+        thinkingEffort: resolveThinkingEffortForModel(fallbackModel, undefined)
+      };
+    }
+
+    const currentPreference = composerPrefsBySession[selectedSessionKey];
+    const model = resolveComposerModel(currentPreference?.model);
+    const thinkingEffort = resolveThinkingEffortForModel(
+      model,
+      currentPreference?.thinkingEffort
+    );
+    return { model, thinkingEffort };
+  }, [
+    selectedSessionKey,
+    composerPrefsBySession
+  ]);
+
+  const modelOptions = useMemo(() => {
+    const rawAvailable =
+      selectedSession ? availableModelsByDevice[selectedSession.deviceId] : undefined;
+    const availabilityKnown = Array.isArray(rawAvailable);
+    const available = new Set(
+      (rawAvailable ?? [])
+        .map((modelId) => resolveSupportedModelId(modelId))
+        .filter((modelId): modelId is string => modelId !== null)
+    );
+
+    return MODEL_CATALOG.map((entry) => {
+      const disabled = availabilityKnown && !available.has(entry.id);
+      return {
+        value: entry.id,
+        label: disabled ? `${entry.label} (Unavailable)` : entry.label,
+        disabled
+      };
+    });
+  }, [selectedSession, availableModelsByDevice]);
+
+  const thinkingOptions = useMemo(
+    () =>
+      getSupportedThinkingEfforts(composerSelection.model).map((effort) => ({
+        value: effort,
+        label: getThinkingEffortLabel(effort)
+      })),
+    [composerSelection.model]
+  );
+
   return (
     <div className={`app-shell ${resizingSidebar ? "app-shell--resizing" : ""}`} ref={shellRef}>
       <div className="app-shell__sidebar-pane" style={{ width: `${sidebarWidth}px` }}>
@@ -234,6 +298,22 @@ export default function App() {
           sessionKey={selectedSessionKey}
           disabled={loading || selectedSessionKey === null}
           focusToken={composerFocusToken}
+          model={composerSelection.model}
+          thinkingEffort={composerSelection.thinkingEffort}
+          modelOptions={modelOptions}
+          thinkingOptions={thinkingOptions}
+          onModelChange={(model) => {
+            if (!selectedSessionKey) {
+              return;
+            }
+            setComposerModel(selectedSessionKey, model);
+          }}
+          onThinkingEffortChange={(thinkingEffort) => {
+            if (!selectedSessionKey) {
+              return;
+            }
+            setComposerThinkingEffort(selectedSessionKey, thinkingEffort);
+          }}
           onSubmit={submitComposer}
         />
       </main>

@@ -4,12 +4,33 @@ import type {
   FormEvent,
   KeyboardEvent
 } from "react";
-import type { ChatImageAttachment, ComposerSubmission } from "../domain/types";
+import type {
+  ChatImageAttachment,
+  ComposerSubmission,
+  ThinkingEffort
+} from "../domain/types";
+
+interface ComposerModelOption {
+  value: string;
+  label: string;
+  disabled?: boolean;
+}
+
+interface ComposerThinkingOption {
+  value: ThinkingEffort;
+  label: string;
+}
 
 interface ComposerProps {
   sessionKey: string | null;
   disabled: boolean;
   focusToken?: number;
+  model: string;
+  thinkingEffort: ThinkingEffort;
+  modelOptions: ComposerModelOption[];
+  thinkingOptions: ComposerThinkingOption[];
+  onModelChange: (model: string) => void;
+  onThinkingEffortChange: (effort: ThinkingEffort) => void;
   onSubmit: (submission: ComposerSubmission) => Promise<void> | void;
 }
 
@@ -66,6 +87,12 @@ export default function Composer({
   sessionKey,
   disabled,
   focusToken = 0,
+  model,
+  thinkingEffort,
+  modelOptions,
+  thinkingOptions,
+  onModelChange,
+  onThinkingEffortChange,
   onSubmit
 }: ComposerProps) {
   const [draft, setDraft] = useState("");
@@ -93,7 +120,9 @@ export default function Composer({
 
     const submission: ComposerSubmission = {
       prompt,
-      images: attachments.map((attachment) => ({ ...attachment }))
+      images: attachments.map((attachment) => ({ ...attachment })),
+      model,
+      thinkingEffort
     };
     setDraft("");
     setAttachments([]);
@@ -199,6 +228,38 @@ export default function Composer({
         placeholder="Continue this session..."
         rows={3}
       />
+      <div className="composer__selectors">
+        <label className="composer__selector">
+          <span>Model</span>
+          <select
+            value={model}
+            disabled={disabled}
+            onChange={(event) => onModelChange(event.target.value)}
+          >
+            {modelOptions.map((option) => (
+              <option key={option.value} value={option.value} disabled={option.disabled}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="composer__selector">
+          <span>Thinking</span>
+          <select
+            value={thinkingEffort}
+            disabled={disabled}
+            onChange={(event) =>
+              onThinkingEffortChange(event.target.value as ThinkingEffort)
+            }
+          >
+            {thinkingOptions.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
       <div className="composer__actions">
         <p>Paste image with Ctrl/Cmd + V. Send with Ctrl/Cmd + Enter.</p>
         <button

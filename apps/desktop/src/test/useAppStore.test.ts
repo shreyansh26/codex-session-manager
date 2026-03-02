@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import type { ChatMessage, ThreadTokenUsageState } from "../domain/types";
+import type {
+  ChatMessage,
+  ComposerPreference,
+  ThreadTokenUsageState
+} from "../domain/types";
 import { __TEST_ONLY__ } from "../state/useAppStore";
 
 const buildMessage = (partial: Partial<ChatMessage>): ChatMessage => ({
@@ -153,6 +157,89 @@ describe("useAppStore message upsert behavior", () => {
     expect(merged[2]).toMatchObject({
       id: "assistant-1",
       role: "assistant"
+    });
+  });
+});
+
+describe("useAppStore composer preference helpers", () => {
+  it("defaults to catalog model and its configured default effort when missing", () => {
+    expect(
+      __TEST_ONLY__.toComposerPreference({
+        model: undefined,
+        effort: undefined
+      })
+    ).toEqual({
+      model: "gpt-5.3-codex",
+      thinkingEffort: "xhigh"
+    });
+  });
+
+  it("coerces unsupported effort to nearest valid default for selected model", () => {
+    expect(
+      __TEST_ONLY__.toComposerPreference({
+        model: "gpt-5.1-codex-mini",
+        effort: "xhigh"
+      })
+    ).toEqual({
+      model: "gpt-5.1-codex-mini",
+      thinkingEffort: "medium"
+    });
+  });
+
+  it("keeps existing preference map reference when no change is needed", () => {
+    const initial = {
+      "device-1::thread-1": {
+        model: "gpt-5.2-codex",
+        thinkingEffort: "high"
+      }
+    } as const;
+    const next = __TEST_ONLY__.upsertComposerPreference(
+      initial,
+      "device-1::thread-1",
+      "gpt-5.2-codex",
+      "high"
+    );
+    expect(next).toBe(initial);
+  });
+
+  it("updates effort when switching to model with narrower effort support", () => {
+    const initial: Record<string, ComposerPreference> = {
+      "device-1::thread-1": {
+        model: "gpt-5.2-codex",
+        thinkingEffort: "xhigh"
+      }
+    };
+    const next = __TEST_ONLY__.upsertComposerPreference(
+      initial,
+      "device-1::thread-1",
+      "gpt-5.1-codex-mini",
+      undefined
+    );
+    expect(next).not.toBe(initial);
+    expect(next["device-1::thread-1"]).toEqual({
+      model: "gpt-5.1-codex-mini",
+      thinkingEffort: "medium"
+    });
+  });
+
+  it("keeps existing model when no explicit model override is provided", () => {
+    const initial: Record<string, ComposerPreference> = {
+      "device-1::thread-1": {
+        model: "gpt-5.3-codex",
+        thinkingEffort: "xhigh"
+      }
+    };
+    const next = __TEST_ONLY__.upsertComposerPreference(
+      initial,
+      "device-1::thread-1",
+      undefined,
+      undefined
+    );
+
+    expect(next).toBe(initial);
+    expect(next["device-1::thread-1"]).toEqual({
+      model: "gpt-5.3-codex",
+      thinkingEffort: "xhigh"
     });
   });
 });

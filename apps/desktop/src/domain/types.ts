@@ -1,5 +1,6 @@
 export type DeviceKind = "local" | "ssh";
 export type ChatRole = "user" | "assistant" | "system" | "tool";
+export type ThinkingEffort = "low" | "medium" | "high" | "xhigh";
 
 export interface DeviceConnection {
   endpoint: string;
@@ -103,6 +104,13 @@ export interface ChatImageAttachment {
 export interface ComposerSubmission {
   prompt: string;
   images: ChatImageAttachment[];
+  model: string;
+  thinkingEffort: ThinkingEffort;
+}
+
+export interface ComposerPreference {
+  model: string;
+  thinkingEffort: ThinkingEffort;
 }
 
 export interface ThreadPayload {
