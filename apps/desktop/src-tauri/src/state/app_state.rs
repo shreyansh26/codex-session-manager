@@ -472,15 +472,54 @@ impl ManagedProcess {
 }
 
 fn spawn_local_runtime(config: &LocalDeviceConfig) -> Result<ConnectionRuntime, AppStateError> {
-    let program = config.codex_bin.as_deref().unwrap_or("codex").to_owned();
     let local_port = config.app_server_port.unwrap_or(allocate_port()?);
     let endpoint = format!("ws://127.0.0.1:{local_port}");
 
-    let args = vec![
-        "app-server".to_owned(),
-        "--listen".to_owned(),
-        endpoint.clone(),
-    ];
+    let (program, args) = if cfg!(target_os = "windows") {
+        let program = config.codex_bin.as_deref().unwrap_or("codex").to_owned();
+        let args = vec![
+            "app-server".to_owned(),
+            "--listen".to_owned(),
+            endpoint.clone(),
+        ];
+        (program, args)
+    } else {
+        let quoted_endpoint = quote_shell(&endpoint);
+        let launch_cmd = if let Some(codex_bin) = config.codex_bin.as_deref() {
+            let codex_dir = Path::new(codex_bin)
+                .parent()
+                .and_then(Path::to_str)
+                .map(str::to_owned);
+            if let Some(dir) = codex_dir {
+                format!(
+                    "PATH={}:$PATH {} app-server --listen {}",
+                    quote_shell(&dir),
+                    quote_shell(codex_bin),
+                    quoted_endpoint
+                )
+            } else {
+                format!(
+                    "{} app-server --listen {}",
+                    quote_shell(codex_bin),
+                    quoted_endpoint
+                )
+            }
+        } else {
+            // Finder-launched macOS apps do not inherit shell PATH; load nvm when needed.
+            format!(
+                "if command -v codex >/dev/null 2>&1; then codex app-server --listen {listen}; \
+elif [ -x /opt/homebrew/bin/codex ]; then PATH=/opt/homebrew/bin:$PATH /opt/homebrew/bin/codex app-server --listen {listen}; \
+elif [ -x /usr/local/bin/codex ]; then PATH=/usr/local/bin:$PATH /usr/local/bin/codex app-server --listen {listen}; \
+elif [ -x \"$HOME/.local/bin/codex\" ]; then PATH=\"$HOME/.local/bin:$PATH\" \"$HOME/.local/bin/codex\" app-server --listen {listen}; \
+elif command -v fnm >/dev/null 2>&1 && eval \"$(fnm env --shell bash)\" >/dev/null 2>&1 && command -v codex >/dev/null 2>&1; then codex app-server --listen {listen}; \
+elif [ -d \"$HOME/.local/state/fnm_multishells\" ] && latest_fnm_codex=$(ls -t \"$HOME\"/.local/state/fnm_multishells/*/bin/codex 2>/dev/null | head -n 1) && [ -n \"$latest_fnm_codex\" ]; then PATH=\"$(dirname \"$latest_fnm_codex\"):$PATH\" \"$latest_fnm_codex\" app-server --listen {listen}; \
+elif [ -s \"$HOME/.nvm/nvm.sh\" ] && . \"$HOME/.nvm/nvm.sh\" >/dev/null 2>&1 && command -v codex >/dev/null 2>&1; then codex app-server --listen {listen}; \
+else echo 'codex binary not found on PATH/homebrew/local/fnm/nvm; set explicit local codex path in device config' >&2; exit 127; fi",
+                listen = quoted_endpoint
+            )
+        };
+        ("bash".to_owned(), vec!["-lc".to_owned(), launch_cmd])
+    };
 
     let mut local_server = ManagedProcess::spawn(
         "local-app-server",
@@ -586,8 +625,13 @@ fn spawn_ssh_runtime(config: &SshDeviceConfig) -> Result<ConnectionRuntime, AppS
     } else {
         format!(
             "if command -v codex >/dev/null 2>&1; then codex app-server --listen {listen}; \
-elif [ -s \"$HOME/.nvm/nvm.sh\" ]; then . \"$HOME/.nvm/nvm.sh\" >/dev/null 2>&1 && codex app-server --listen {listen}; \
-else codex app-server --listen {listen}; fi",
+elif [ -x /opt/homebrew/bin/codex ]; then PATH=/opt/homebrew/bin:$PATH /opt/homebrew/bin/codex app-server --listen {listen}; \
+elif [ -x /usr/local/bin/codex ]; then PATH=/usr/local/bin:$PATH /usr/local/bin/codex app-server --listen {listen}; \
+elif [ -x \"$HOME/.local/bin/codex\" ]; then PATH=\"$HOME/.local/bin:$PATH\" \"$HOME/.local/bin/codex\" app-server --listen {listen}; \
+elif command -v fnm >/dev/null 2>&1 && eval \"$(fnm env --shell bash)\" >/dev/null 2>&1 && command -v codex >/dev/null 2>&1; then codex app-server --listen {listen}; \
+elif [ -d \"$HOME/.local/state/fnm_multishells\" ] && latest_fnm_codex=$(ls -t \"$HOME\"/.local/state/fnm_multishells/*/bin/codex 2>/dev/null | head -n 1) && [ -n \"$latest_fnm_codex\" ]; then PATH=\"$(dirname \"$latest_fnm_codex\"):$PATH\" \"$latest_fnm_codex\" app-server --listen {listen}; \
+elif [ -s \"$HOME/.nvm/nvm.sh\" ] && . \"$HOME/.nvm/nvm.sh\" >/dev/null 2>&1 && command -v codex >/dev/null 2>&1; then codex app-server --listen {listen}; \
+else echo 'codex binary not found on PATH/homebrew/local/fnm/nvm; set explicit codex path in device config' >&2; exit 127; fi",
             listen = quoted_listen_uri
         )
     };
