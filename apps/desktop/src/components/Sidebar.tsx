@@ -6,6 +6,7 @@ import type {
   DeviceRecord,
   SessionSummary
 } from "../domain/types";
+import { groupSessionsByFolder } from "./sidebarGrouping";
 
 interface SidebarProps {
   devices: DeviceRecord[];
@@ -90,18 +91,6 @@ const deviceAddress = (device: DeviceRecord): string => {
   return "local";
 };
 
-const folderChipText = (session: SessionSummary): string => {
-  if (session.folderName) {
-    return session.folderName;
-  }
-  if (session.cwd) {
-    const normalized = session.cwd.replace(/\\/g, "/").replace(/\/+$/, "");
-    const parts = normalized.split("/");
-    return parts[parts.length - 1] || "unknown-folder";
-  }
-  return "unknown-folder";
-};
-
 const toErrorMessage = (error: unknown): string => {
   if (error instanceof Error && error.message.trim().length > 0) {
     return error.message;
@@ -136,6 +125,7 @@ export default function Sidebar({
   const [identityFile, setIdentityFile] = useState("");
   const [sshFormOpen, setSshFormOpen] = useState(false);
   const [collapsedByDevice, setCollapsedByDevice] = useState<Record<string, boolean>>({});
+  const [collapsedByFolder, setCollapsedByFolder] = useState<Record<string, boolean>>({});
   const [newSessionOpenByDevice, setNewSessionOpenByDevice] = useState<
     Record<string, boolean>
   >({});
@@ -288,6 +278,7 @@ export default function Sidebar({
         {devices.map((device) => {
           const status = toStatus(device);
           const deviceSessions = sessionsByDevice.get(device.id) ?? [];
+          const folderGroups = groupSessionsByFolder(deviceSessions);
           const isCollapsed = collapsedByDevice[device.id] ?? false;
           const isLocalDevice = device.config.kind === "local";
           const fallbackSessionPath = deviceSessions[0]?.cwd;
@@ -509,37 +500,76 @@ export default function Sidebar({
               ) : null}
 
               {!isCollapsed ? (
-                <ul className="sidebar__session-list">
+                <ul className="sidebar__folder-list">
                   {deviceSessions.length === 0 ? (
                     <li className="sidebar__empty">No sessions</li>
                   ) : (
-                    deviceSessions.map((session) => (
-                      <li key={session.key}>
-                        <button
-                          type="button"
-                          className={`session-row ${
-                            selectedSessionKey === session.key ? "session-row--active" : ""
-                          }`}
-                          title={session.title}
-                          onClick={() => onSelectSession(session.key)}
-                        >
-                          <div className="session-row__meta">
-                            <div className="session-row__title-wrap">
-                              <strong className="session-row__title">{session.title}</strong>
-                            </div>
-                            <span
-                              className="session-row__timestamp"
-                              title={new Date(session.updatedAt).toLocaleString()}
-                            >
-                              {formatTimestamp(session.updatedAt)}
+                    folderGroups.map((group) => {
+                      const folderStateKey = `${device.id}::${group.key}`;
+                      const isFolderCollapsed = collapsedByFolder[folderStateKey] ?? true;
+
+                      return (
+                        <li key={folderStateKey} className="sidebar__folder-group">
+                          <button
+                            type="button"
+                            className="sidebar__folder-toggle"
+                            onClick={() =>
+                              setCollapsedByFolder((previous) => ({
+                                ...previous,
+                                [folderStateKey]: !isFolderCollapsed
+                              }))
+                            }
+                            aria-expanded={!isFolderCollapsed}
+                            aria-label={
+                              isFolderCollapsed
+                                ? `Expand folder ${group.label}`
+                                : `Collapse folder ${group.label}`
+                            }
+                          >
+                            <span className="sidebar__folder-toggle-icon" aria-hidden="true">
+                              {isFolderCollapsed ? "▸" : "▾"}
                             </span>
-                          </div>
-                          <span className="session-row__folder-chip">
-                            {folderChipText(session)}
-                          </span>
-                        </button>
-                      </li>
-                    ))
+                            <span className="sidebar__folder-label">{group.label}</span>
+                            <span className="sidebar__folder-count">
+                              {group.sessions.length}
+                            </span>
+                          </button>
+
+                          {!isFolderCollapsed ? (
+                            <ul className="sidebar__folder-session-list">
+                              {group.sessions.map((session) => (
+                                <li key={session.key}>
+                                  <button
+                                    type="button"
+                                    className={`session-row ${
+                                      selectedSessionKey === session.key
+                                        ? "session-row--active"
+                                        : ""
+                                    }`}
+                                    title={session.title}
+                                    onClick={() => onSelectSession(session.key)}
+                                  >
+                                    <div className="session-row__meta">
+                                      <div className="session-row__title-wrap">
+                                        <strong className="session-row__title">
+                                          {session.title}
+                                        </strong>
+                                      </div>
+                                      <span
+                                        className="session-row__timestamp"
+                                        title={new Date(session.updatedAt).toLocaleString()}
+                                      >
+                                        {formatTimestamp(session.updatedAt)}
+                                      </span>
+                                    </div>
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          ) : null}
+                        </li>
+                      );
+                    })
                   )}
                 </ul>
               ) : (

@@ -309,15 +309,70 @@
   color: #ffb2b2;
 }
 
-.sidebar__session-list {
+.sidebar__folder-list {
   list-style: none;
   margin: 0;
   padding: 0;
   display: grid;
-  gap: 0.45rem;
+  gap: 0.48rem;
 }
 
-.sidebar__session-list li {
+.sidebar__folder-group {
+  min-width: 0;
+}
+
+.sidebar__folder-toggle {
+  width: 100%;
+  border: 1px solid color-mix(in srgb, var(--line) 86%, transparent);
+  border-radius: 8px;
+  background: rgba(9, 13, 18, 0.72);
+  color: inherit;
+  padding: 0.36rem 0.44rem;
+  cursor: pointer;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.sidebar__folder-toggle:hover {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--line));
+}
+
+.sidebar__folder-toggle-icon {
+  width: 0.85rem;
+  text-align: center;
+  color: color-mix(in srgb, var(--text-muted) 92%, #d7e5ff);
+}
+
+.sidebar__folder-label {
+  font-size: 0.74rem;
+  color: color-mix(in srgb, var(--text-main) 94%, #eff6ff);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sidebar__folder-count {
+  font-size: 0.66rem;
+  color: color-mix(in srgb, var(--text-muted) 90%, #d7e5ff);
+  border: 1px solid color-mix(in srgb, var(--line) 86%, transparent);
+  border-radius: 999px;
+  padding: 0.08rem 0.35rem;
+  background: rgba(10, 16, 24, 0.8);
+}
+
+.sidebar__folder-session-list {
+  list-style: none;
+  margin: 0.34rem 0 0;
+  padding: 0 0 0 0.6rem;
+  display: grid;
+  gap: 0.35rem;
+  border-left: 1px solid color-mix(in srgb, var(--line) 82%, transparent);
+}
+
+.sidebar__folder-session-list li {
   min-width: 0;
 }
 
@@ -391,21 +446,6 @@
   text-align: right;
   width: 4.4ch;
   justify-self: end;
-}
-
-.session-row__folder-chip {
-  display: inline-flex;
-  margin-top: 0.35rem;
-  border: 1px solid color-mix(in srgb, var(--line) 85%, transparent);
-  border-radius: 999px;
-  padding: 0.12rem 0.45rem;
-  font-size: 0.67rem;
-  color: color-mix(in srgb, var(--text-muted) 90%, #d7e5ff);
-  background: rgba(12, 18, 28, 0.75);
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .workspace {
