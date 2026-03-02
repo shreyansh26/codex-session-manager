@@ -8,7 +8,9 @@ import type {
   DeviceRecord,
   NewSessionRequest,
   RpcNotification,
-  SessionSummary
+  SessionSummary,
+  TokenUsageBreakdown,
+  ThreadTokenUsageState
 } from "../domain/types";
 import {
   closeAllClients,
@@ -22,7 +24,12 @@ import {
   startThread,
   startTurn
 } from "../services/codexApi";
-import { parseRpcNotification } from "../services/eventParser";
+import {
+  parseRpcNotification,
+  parseThreadModelNotification,
+  parseThreadTokenUsageNotification
+} from "../services/eventParser";
+import { computeCostUsdFromUsage, resolveModelPricing } from "../services/modelPricing";
 import {
   addLocalDevice,
   addSshDevice,
@@ -39,6 +46,9 @@ interface AppStore {
   sessions: SessionSummary[];
   selectedSessionKey: string | null;
   messagesBySession: Record<string, ChatMessage[]>;
+  tokenUsageBySession: Record<string, ThreadTokenUsageState>;
+  modelBySession: Record<string, string>;
+  costUsdBySession: Record<string, number | null>;
   globalError: string | null;
   initializing: boolean;
   initialize: () => Promise<void>;
@@ -73,7 +83,6 @@ const PENDING_OPTIMISTIC_RETAIN_MS = 120_000;
 const OPTIMISTIC_ACK_CLOCK_SKEW_MS = 8_000;
 const OPTIMISTIC_ACK_MAX_DELAY_MS = 45_000;
 const SERVER_DUPLICATE_WINDOW_MS = 120_000;
-const REASONING_BUFFER_MAX_WAIT_MS = 8_000;
 
 const pickSelectedSession = (
   preferred: string | null,
@@ -83,6 +92,27 @@ const pickSelectedSession = (
     return preferred;
   }
   return sessions[0]?.key ?? null;
+};
+
+const resolveSessionKeyForThread = (
+  sessions: SessionSummary[],
+  deviceId: string,
+  threadId: string
+): string => {
+  const directKey = makeSessionKey(deviceId, threadId);
+  if (sessions.some((session) => session.key === directKey)) {
+    return directKey;
+  }
+
+  const sameThreadSameDevice = sessions.find(
+    (session) => session.deviceId === deviceId && session.threadId === threadId
+  );
+  if (sameThreadSameDevice) {
+    return sameThreadSameDevice.key;
+  }
+
+  const sameThreadAnyDevice = sessions.find((session) => session.threadId === threadId);
+  return sameThreadAnyDevice?.key ?? directKey;
 };
 
 const upsertDevice = (
@@ -410,7 +440,11 @@ const mergeThreadMessages = (
   existing: ChatMessage[],
   incoming: ChatMessage[]
 ): ChatMessage[] => {
-  let merged = [...incoming];
+  let merged: ChatMessage[] = [];
+  const incomingSorted = [...incoming].sort(sortMessagesAscending);
+  for (const message of incomingSorted) {
+    merged = upsertMessage(merged, message);
+  }
   const nowMs = Date.now();
 
   for (const message of existing) {
@@ -461,6 +495,80 @@ const isValidIsoTimestamp = (value: string): boolean =>
 const shouldIgnoreResumeError = (error: unknown): boolean => {
   const message = toErrorMessage(error).toLowerCase();
   return message.includes("no rollout found for thread id");
+};
+
+const computeSessionCostUsd = (
+  model: string | undefined,
+  tokenUsage: ThreadTokenUsageState | undefined
+): number | null => {
+  if (!model || !tokenUsage) {
+    return null;
+  }
+
+  const pricing = resolveModelPricing(model);
+  if (!pricing) {
+    return null;
+  }
+
+  return computeCostUsdFromUsage(tokenUsage.total, pricing);
+};
+
+const makeUsageDeltaEventKey = (
+  turnId: string | undefined,
+  lastUsage: TokenUsageBreakdown
+): string =>
+  [
+    turnId ?? "no-turn",
+    lastUsage.totalTokens,
+    lastUsage.inputTokens,
+    lastUsage.cachedInputTokens,
+    lastUsage.outputTokens,
+    lastUsage.reasoningOutputTokens
+  ].join(":");
+
+const accumulateSessionCostFromLast = (params: {
+  currentCostUsd: number | null | undefined;
+  model: string | undefined;
+  tokenUsage: ThreadTokenUsageState;
+  lastAppliedEventKey: string | undefined;
+}): { nextCostUsd: number | null; nextAppliedEventKey: string | undefined } => {
+  const currentCostUsd =
+    typeof params.currentCostUsd === "number" ? params.currentCostUsd : null;
+  if (!params.model) {
+    return {
+      nextCostUsd: currentCostUsd,
+      nextAppliedEventKey: params.lastAppliedEventKey
+    };
+  }
+
+  const pricing = resolveModelPricing(params.model);
+  if (!pricing) {
+    return {
+      nextCostUsd: currentCostUsd,
+      nextAppliedEventKey: params.lastAppliedEventKey
+    };
+  }
+
+  const usageEventKey = makeUsageDeltaEventKey(params.tokenUsage.turnId, params.tokenUsage.last);
+  if (usageEventKey === params.lastAppliedEventKey) {
+    return {
+      nextCostUsd: currentCostUsd,
+      nextAppliedEventKey: params.lastAppliedEventKey
+    };
+  }
+
+  const lastCostUsd = computeCostUsdFromUsage(params.tokenUsage.last, pricing);
+  if (lastCostUsd === null) {
+    return {
+      nextCostUsd: currentCostUsd,
+      nextAppliedEventKey: params.lastAppliedEventKey
+    };
+  }
+
+  return {
+    nextCostUsd: (currentCostUsd ?? 0) + lastCostUsd,
+    nextAppliedEventKey: usageEventKey
+  };
 };
 
 const sessionsEqual = (
@@ -515,15 +623,7 @@ const pickString = (
 export const useAppStore = create<AppStore>((set, get) => {
   const notificationRefreshAtMs = new Map<string, number>();
   const postSendRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  const reasoningBuffers = new Map<
-    string,
-    {
-      message: ChatMessage;
-      content: string;
-      startedAtMs: number;
-      timer: ReturnType<typeof setTimeout> | null;
-    }
-  >();
+  const lastAppliedCostEventKeyBySession = new Map<string, string>();
 
   const stopPostSendRefresh = (sessionKey: string): void => {
     const pendingTimer = postSendRefreshTimers.get(sessionKey);
@@ -542,124 +642,12 @@ export const useAppStore = create<AppStore>((set, get) => {
     }
   };
 
-  const stopReasoningBufferTimer = (bufferKey: string): void => {
-    const pending = reasoningBuffers.get(bufferKey);
-    if (!pending || pending.timer === null) {
-      return;
-    }
-    clearTimeout(pending.timer);
-    pending.timer = null;
-  };
-
-  const flushReasoningBuffer = (bufferKey: string): void => {
-    const pending = reasoningBuffers.get(bufferKey);
-    if (!pending) {
-      return;
-    }
-    stopReasoningBufferTimer(bufferKey);
-    reasoningBuffers.delete(bufferKey);
-
-    const mergedContent = pending.content.trim();
-    const message: ChatMessage = {
-      ...pending.message,
-      content: mergedContent.length > 0 ? mergedContent : pending.message.content
-    };
-
-    const sessionKey = message.key;
-    set((state) => {
-      const current = state.messagesBySession[sessionKey] ?? [];
-      const next = upsertMessage(current, message);
-      return {
-        messagesBySession: {
-          ...state.messagesBySession,
-          [sessionKey]: next
-        }
-      };
-    });
-  };
-
-  const queueReasoningBuffer = (
-    sessionKey: string,
-    message: ChatMessage,
-    method: string
-  ): void => {
-    const bufferKey = `${sessionKey}::${message.id}`;
-    const nowMs = Date.now();
-    const existing = reasoningBuffers.get(bufferKey);
-    const pending =
-      existing ??
-      {
-        message: { ...message, content: "" },
-        content: "",
-        startedAtMs: nowMs,
-        timer: null
-      };
-
-    pending.message = { ...pending.message, ...message, content: pending.message.content };
-    if (message.content.length > 0) {
-      pending.content = appendStreamingChunk(pending.content, message.content);
-    }
-    reasoningBuffers.set(bufferKey, pending);
-
-    const isFinal =
-      method.includes("completed") ||
-      method.includes("done") ||
-      method.includes("final");
-    if (isFinal || nowMs - pending.startedAtMs >= REASONING_BUFFER_MAX_WAIT_MS) {
-      flushReasoningBuffer(bufferKey);
-      return;
-    }
-
-    if (pending.timer === null) {
-      pending.timer = setTimeout(() => {
-        flushReasoningBuffer(bufferKey);
-      }, REASONING_BUFFER_MAX_WAIT_MS);
-    }
-  };
-
-  const clearReasoningBuffersForDevice = (deviceId: string): void => {
+  const clearAppliedCostEventKeysForDevice = (deviceId: string): void => {
     const prefix = `${deviceId}::`;
-    for (const key of reasoningBuffers.keys()) {
-      if (!key.startsWith(prefix)) {
-        continue;
+    for (const sessionKey of lastAppliedCostEventKeyBySession.keys()) {
+      if (sessionKey.startsWith(prefix)) {
+        lastAppliedCostEventKeyBySession.delete(sessionKey);
       }
-      stopReasoningBufferTimer(key);
-      reasoningBuffers.delete(key);
-    }
-  };
-
-  const dropEquivalentReasoningBuffers = (
-    sessionKey: string,
-    assistantMessage: ChatMessage
-  ): void => {
-    const normalizedAssistant = normalizeMessageText(assistantMessage.content);
-    if (normalizedAssistant.length === 0) {
-      return;
-    }
-
-    for (const [key, pending] of reasoningBuffers.entries()) {
-      if (!key.startsWith(`${sessionKey}::`)) {
-        continue;
-      }
-      if (pending.message.eventType !== "reasoning") {
-        continue;
-      }
-
-      const bufferedText = normalizeMessageText(pending.content);
-      if (bufferedText.length === 0) {
-        continue;
-      }
-
-      const equivalentText =
-        bufferedText === normalizedAssistant ||
-        bufferedText.startsWith(normalizedAssistant) ||
-        normalizedAssistant.startsWith(bufferedText);
-      if (!equivalentText) {
-        continue;
-      }
-
-      stopReasoningBufferTimer(key);
-      reasoningBuffers.delete(key);
     }
   };
 
@@ -705,17 +693,22 @@ export const useAppStore = create<AppStore>((set, get) => {
     if (
       !method.startsWith("turn/") &&
       !method.startsWith("message/") &&
-      !method.startsWith("item/")
+      !method.startsWith("item/") &&
+      !method.startsWith("codex/event/")
     ) {
       return;
     }
 
     const params = asRecord(notification.params);
+    const msg = asRecord(params?.msg);
     const threadId =
       pickString(params, ["threadId", "thread_id"]) ??
+      pickString(params, ["conversationId", "conversation_id"]) ??
       pickString(asRecord(params?.message), ["threadId", "thread_id"]) ??
       pickString(asRecord(params?.item), ["threadId", "thread_id"]) ??
-      pickString(asRecord(params?.turn), ["threadId", "thread_id"]);
+      pickString(asRecord(params?.turn), ["threadId", "thread_id"]) ??
+      pickString(msg, ["thread_id", "threadId", "session_id", "sessionId"]) ??
+      pickString(msg, ["conversationId", "conversation_id"]);
     if (!threadId) {
       return;
     }
@@ -732,35 +725,113 @@ export const useAppStore = create<AppStore>((set, get) => {
   };
 
   const applyNotification = (deviceId: string, notification: RpcNotification): void => {
-    const method = notification.method.replaceAll(".", "/").toLowerCase();
+    const parsedModel = parseThreadModelNotification(notification);
+    if (parsedModel) {
+      set((state) => {
+        const sessionKey = resolveSessionKeyForThread(
+          state.sessions,
+          deviceId,
+          parsedModel.threadId
+        );
+        const nextModelBySession = {
+          ...state.modelBySession,
+          [sessionKey]: parsedModel.model
+        };
+        const tokenUsage = state.tokenUsageBySession[sessionKey];
+        const currentCostUsd = state.costUsdBySession[sessionKey];
+        let nextCostUsd =
+          typeof currentCostUsd === "number" ? currentCostUsd : null;
+
+        // If we did not have model pricing at the time token usage arrived,
+        // bootstrap from cumulative total once the model is known.
+        if (nextCostUsd === null) {
+          nextCostUsd = computeSessionCostUsd(parsedModel.model, tokenUsage);
+          if (nextCostUsd !== null && tokenUsage) {
+            lastAppliedCostEventKeyBySession.set(
+              sessionKey,
+              makeUsageDeltaEventKey(tokenUsage.turnId, tokenUsage.last)
+            );
+          }
+        }
+
+        return {
+          modelBySession: nextModelBySession,
+          costUsdBySession: {
+            ...state.costUsdBySession,
+            [sessionKey]: nextCostUsd
+          }
+        };
+      });
+    }
+
+    const selectedSession =
+      get().sessions.find((session) => session.key === get().selectedSessionKey) ?? null;
+    const parsedTokenUsage = parseThreadTokenUsageNotification(
+      notification,
+      selectedSession?.threadId
+    );
+    if (parsedTokenUsage) {
+      const tokenUsageState: ThreadTokenUsageState = {
+        threadId: parsedTokenUsage.threadId,
+        ...(parsedTokenUsage.turnId ? { turnId: parsedTokenUsage.turnId } : {}),
+        total: parsedTokenUsage.tokenUsage.total,
+        last: parsedTokenUsage.tokenUsage.last,
+        modelContextWindow: parsedTokenUsage.tokenUsage.modelContextWindow ?? null,
+        updatedAt: new Date().toISOString()
+      };
+
+      set((state) => {
+        const sessionKey = resolveSessionKeyForThread(
+          state.sessions,
+          deviceId,
+          parsedTokenUsage.threadId
+        );
+        const model = state.modelBySession[sessionKey];
+        const accumulation = accumulateSessionCostFromLast({
+          currentCostUsd: state.costUsdBySession[sessionKey],
+          model,
+          tokenUsage: tokenUsageState,
+          lastAppliedEventKey: lastAppliedCostEventKeyBySession.get(sessionKey)
+        });
+        if (accumulation.nextAppliedEventKey) {
+          lastAppliedCostEventKeyBySession.set(
+            sessionKey,
+            accumulation.nextAppliedEventKey
+          );
+        }
+        const nextCostUsd = accumulation.nextCostUsd;
+        return {
+          tokenUsageBySession: {
+            ...state.tokenUsageBySession,
+            [sessionKey]: tokenUsageState
+          },
+          costUsdBySession: {
+            ...state.costUsdBySession,
+            [sessionKey]: nextCostUsd
+          }
+        };
+      });
+      return;
+    }
+
     const parsed = parseRpcNotification(deviceId, notification);
     if (!parsed) {
       refreshThreadFromNotification(deviceId, notification);
       return;
     }
 
-    const sessionKey = makeSessionKey(deviceId, parsed.threadId);
-
-    if (
-      parsed.message.eventType === "reasoning" &&
-      parsed.message.role !== "user"
-    ) {
-      queueReasoningBuffer(sessionKey, parsed.message, method);
-      refreshThreadFromNotification(deviceId, notification);
-      return;
-    }
-
-    if (parsed.message.role === "assistant") {
-      dropEquivalentReasoningBuffers(sessionKey, parsed.message);
-    }
-
     set((state) => {
-      const current = state.messagesBySession[sessionKey] ?? [];
+      const resolvedSessionKey = resolveSessionKeyForThread(
+        state.sessions,
+        deviceId,
+        parsed.threadId
+      );
+      const current = state.messagesBySession[resolvedSessionKey] ?? [];
       const next = upsertMessage(current, parsed.message);
       return {
         messagesBySession: {
           ...state.messagesBySession,
-          [sessionKey]: next
+          [resolvedSessionKey]: next
         }
       };
     });
@@ -787,6 +858,9 @@ export const useAppStore = create<AppStore>((set, get) => {
     sessions: [],
     selectedSessionKey: null,
     messagesBySession: {},
+    tokenUsageBySession: {},
+    modelBySession: {},
+    costUsdBySession: {},
     globalError: null,
     initialize: async () => {
       if (get().initializing) {
@@ -1003,9 +1077,26 @@ export const useAppStore = create<AppStore>((set, get) => {
             state.sessions.some((session) => session.key === payload.session.key)
               ? state.sessions
               : mergeSessions(state.sessions, [payload.session]);
+          const nextModelBySession = payload.model
+            ? {
+                ...state.modelBySession,
+                [payload.session.key]: payload.model
+              }
+            : state.modelBySession;
+          const nextCostUsdBySession = payload.model
+            ? {
+                ...state.costUsdBySession,
+                [payload.session.key]: computeSessionCostUsd(
+                  payload.model,
+                  state.tokenUsageBySession[payload.session.key]
+                )
+              }
+            : state.costUsdBySession;
 
           return {
             sessions: nextSessions,
+            modelBySession: nextModelBySession,
+            costUsdBySession: nextCostUsdBySession,
             messagesBySession: options?.skipMessages
               ? state.messagesBySession
               : {
@@ -1037,10 +1128,26 @@ export const useAppStore = create<AppStore>((set, get) => {
 
       const started = await startThread(device, cwd);
       const payload = await readThread(device, started.threadId);
+      const model = payload.model ?? started.model;
 
       set((state) => ({
         sessions: mergeSessions(state.sessions, [payload.session]),
         selectedSessionKey: payload.session.key,
+        modelBySession: model
+          ? {
+              ...state.modelBySession,
+              [payload.session.key]: model
+            }
+          : state.modelBySession,
+        costUsdBySession: model
+          ? {
+              ...state.costUsdBySession,
+              [payload.session.key]: computeSessionCostUsd(
+                model,
+                state.tokenUsageBySession[payload.session.key]
+              )
+            }
+          : state.costUsdBySession,
         messagesBySession: {
           ...state.messagesBySession,
           [payload.session.key]: mergeThreadMessages(
@@ -1111,7 +1218,25 @@ export const useAppStore = create<AppStore>((set, get) => {
       void (async () => {
         try {
           try {
-            await resumeThread(device, threadId);
+            const resumed = await resumeThread(device, threadId);
+            if (resumed.model) {
+              const resumedModel = resumed.model;
+              set((state) => ({
+                modelBySession: {
+                  ...state.modelBySession,
+                  [session.key]: resumedModel
+                },
+                costUsdBySession: {
+                  ...state.costUsdBySession,
+                  [session.key]:
+                    state.costUsdBySession[session.key] ??
+                    computeSessionCostUsd(
+                      resumedModel,
+                      state.tokenUsageBySession[session.key]
+                    )
+                }
+              }));
+            }
           } catch (error) {
             if (!shouldIgnoreResumeError(error)) {
               throw error;
@@ -1163,7 +1288,7 @@ export const useAppStore = create<AppStore>((set, get) => {
         }
 
         stopPostSendRefreshesForDevice(deviceId);
-        clearReasoningBuffersForDevice(deviceId);
+        clearAppliedCostEventKeysForDevice(deviceId);
         const disconnected = await disconnectDevice(deviceId);
         closeDeviceClient(deviceId);
         set((state) => ({
@@ -1181,7 +1306,7 @@ export const useAppStore = create<AppStore>((set, get) => {
         }
 
         stopPostSendRefreshesForDevice(deviceId);
-        clearReasoningBuffersForDevice(deviceId);
+        clearAppliedCostEventKeysForDevice(deviceId);
         const devices = await removeDevice(deviceId);
         closeDeviceClient(deviceId);
         set((state) => {
@@ -1191,11 +1316,29 @@ export const useAppStore = create<AppStore>((set, get) => {
               ([key]) => !key.startsWith(`${deviceId}::`)
             )
           );
+          const modelBySession = Object.fromEntries(
+            Object.entries(state.modelBySession).filter(
+              ([key]) => !key.startsWith(`${deviceId}::`)
+            )
+          );
+          const tokenUsageBySession = Object.fromEntries(
+            Object.entries(state.tokenUsageBySession).filter(
+              ([key]) => !key.startsWith(`${deviceId}::`)
+            )
+          );
+          const costUsdBySession = Object.fromEntries(
+            Object.entries(state.costUsdBySession).filter(
+              ([key]) => !key.startsWith(`${deviceId}::`)
+            )
+          );
 
           return {
             devices,
             sessions,
             messagesBySession,
+            modelBySession,
+            tokenUsageBySession,
+            costUsdBySession,
             selectedSessionKey: pickSelectedSession(state.selectedSessionKey, sessions)
           };
         });
@@ -1216,7 +1359,11 @@ export const shutdownRpcClients = (): void => {
 
 export const __TEST_ONLY__ = {
   upsertMessage,
-  hasAcknowledgedEquivalent
+  mergeThreadMessages,
+  hasAcknowledgedEquivalent,
+  computeSessionCostUsd,
+  makeUsageDeltaEventKey,
+  accumulateSessionCostFromLast
 };
 
 const toErrorMessage = (error: unknown): string => {

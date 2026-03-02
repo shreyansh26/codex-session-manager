@@ -195,6 +195,7 @@ export const readThread = async (
   const baseTitle = deriveSessionBaseTitle(thread, threadId, preview);
   const cwd = pickString(thread, ["cwd", "workingDirectory", "working_directory"]);
   const folderName = folderNameFromPath(cwd);
+  const model = pickThreadModel(thread);
 
   const session: SessionSummary = {
     key: makeSessionKey(device.id, threadId),
@@ -219,31 +220,33 @@ export const readThread = async (
   session.preview = latest?.content?.trim() || session.preview;
   session.updatedAt = session.updatedAt || latest?.createdAt || "";
 
-  return { session, messages };
+  return {
+    session,
+    messages,
+    ...(model ? { model } : {})
+  };
 };
 
 export const resumeThread = async (
   device: DeviceRecord,
   threadId: string
-): Promise<void> => {
+): Promise<{ model?: string }> => {
   const client = await ensureInitialized(device);
-  await callWithFallback(client, "thread/resume", [{ threadId }]);
+  const result = await callWithFallback(client, "thread/resume", [{ threadId }]);
+  const record = asRecord(result);
+  const model =
+    pickString(record, ["model", "modelId", "model_id", "modelName", "model_name"]) ??
+    pickThreadModel(asRecord(record?.thread));
+  return model ? { model } : {};
 };
 
 export const startThread = async (
   device: DeviceRecord,
   cwd: string
-): Promise<{ threadId: string; cwd: string }> => {
+): Promise<{ threadId: string; cwd: string; model?: string }> => {
   const client = await ensureInitialized(device);
   const normalizedCwd = normalizePosixPath(cwd);
-  const result = await callWithFallback(client, "thread/start", [
-    {
-      cwd: normalizedCwd,
-      experimentalRawEvents: false,
-      persistExtendedHistory: true
-    },
-    { cwd: normalizedCwd }
-  ]);
+  const result = await callWithFallback(client, "thread/start", [{ cwd: normalizedCwd }]);
 
   const record = asRecord(result);
   const thread = asRecord(record?.thread);
@@ -258,10 +261,14 @@ export const startThread = async (
     pickString(record, ["cwd", "workingDirectory", "working_directory"]) ??
     pickString(thread, ["cwd", "workingDirectory", "working_directory"]) ??
     normalizedCwd;
+  const model =
+    pickString(record, ["model", "modelId", "model_id", "modelName", "model_name"]) ??
+    pickThreadModel(thread);
 
   return {
     threadId,
-    cwd: normalizePosixPath(resolvedCwd)
+    cwd: normalizePosixPath(resolvedCwd),
+    ...(model ? { model } : {})
   };
 };
 
@@ -932,6 +939,42 @@ const deriveSessionBaseTitle = (
     return threadId;
   }
   return normalized;
+};
+
+const pickThreadModel = (
+  value: Record<string, unknown> | null | undefined,
+  depth = 0
+): string | null => {
+  if (!value || depth > 2) {
+    return null;
+  }
+
+  const direct = pickString(value, ["model", "modelId", "model_id", "modelName", "model_name"]);
+  if (direct) {
+    return direct;
+  }
+
+  const nestedCandidates = [
+    "config",
+    "settings",
+    "metadata",
+    "modelInfo",
+    "model_info",
+    "turn",
+    "lastTurn",
+    "last_turn",
+    "latestMessage",
+    "latest_message"
+  ];
+  for (const key of nestedCandidates) {
+    const nested = asRecord(value[key]);
+    const nestedModel = pickThreadModel(nested, depth + 1);
+    if (nestedModel) {
+      return nestedModel;
+    }
+  }
+
+  return null;
 };
 
 const truncateForPreview = (value: string): string => {

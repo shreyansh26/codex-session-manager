@@ -65,6 +65,33 @@ export interface ChatMessage {
   images?: ChatImageAttachment[];
 }
 
+export interface TokenUsageBreakdown {
+  totalTokens: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+}
+
+export interface ThreadTokenUsage {
+  total: TokenUsageBreakdown;
+  last: TokenUsageBreakdown;
+  modelContextWindow?: number | null;
+}
+
+export interface ThreadTokenUsageState extends ThreadTokenUsage {
+  threadId: string;
+  turnId?: string;
+  updatedAt: string;
+}
+
+export interface SessionCostDisplay {
+  model?: string;
+  tokenUsage?: ThreadTokenUsageState;
+  usdCost?: number;
+  costAvailable: boolean;
+}
+
 export interface ChatImageAttachment {
   id: string;
   url: string;
@@ -81,6 +108,7 @@ export interface ComposerSubmission {
 export interface ThreadPayload {
   session: SessionSummary;
   messages: ChatMessage[];
+  model?: string;
 }
 
 export interface DirectoryEntry {
