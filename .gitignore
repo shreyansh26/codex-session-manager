@@ -10,3 +10,8 @@ target/
 
 CONTINUITY.md
 .agent
+
+# Generated Tauri icons (keep source files)
+apps/desktop/src-tauri/icons/*
+!apps/desktop/src-tauri/icons/icon.png
+!apps/desktop/src-tauri/icons/app-icon.png
