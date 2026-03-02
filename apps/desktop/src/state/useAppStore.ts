@@ -104,6 +104,7 @@ const upsertMessage = (
 ): ChatMessage[] => {
   const existingIndex = existing.findIndex((entry) =>
     isSameLogicalMessage(entry, incoming) ||
+    hasAcknowledgedEquivalent(entry, incoming) ||
     isEquivalentServerMessage(entry, incoming)
   );
   if (existingIndex === -1) {
@@ -226,24 +227,35 @@ const areServerTimestampsClose = (aIso: string, bIso: string): boolean => {
 };
 
 const hasAcknowledgedEquivalent = (
-  optimistic: ChatMessage,
+  current: ChatMessage,
   incoming: ChatMessage
 ): boolean => {
-  if (optimistic.role !== "user" || incoming.role !== "user") {
+  if (current.role !== "user" || incoming.role !== "user") {
     return false;
   }
+
+  const currentOptimistic = isOptimisticMessage(current);
+  const incomingOptimistic = isOptimisticMessage(incoming);
+  // Ack matching should only merge one optimistic local message with one
+  // server-backed message; two optimistic sends with same text must remain distinct.
+  if (currentOptimistic === incomingOptimistic) {
+    return false;
+  }
+
+  const optimistic = currentOptimistic ? current : incoming;
+  const server = currentOptimistic ? incoming : current;
 
   const optimisticText = normalizeMessageText(optimistic.content);
-  const incomingText = normalizeMessageText(incoming.content);
-  if (optimisticText !== incomingText) {
+  const serverText = normalizeMessageText(server.content);
+  if (optimisticText !== serverText) {
     return false;
   }
 
-  if (imageSignature(optimistic) !== imageSignature(incoming)) {
+  if (imageSignature(optimistic) !== imageSignature(server)) {
     return false;
   }
 
-  return isLikelyOptimisticAcknowledgement(optimistic.createdAt, incoming.createdAt);
+  return isLikelyOptimisticAcknowledgement(optimistic.createdAt, server.createdAt);
 };
 
 const isEquivalentServerMessage = (
@@ -507,7 +519,7 @@ export const useAppStore = create<AppStore>((set, get) => {
     string,
     {
       message: ChatMessage;
-      chunks: string[];
+      content: string;
       startedAtMs: number;
       timer: ReturnType<typeof setTimeout> | null;
     }
@@ -547,7 +559,7 @@ export const useAppStore = create<AppStore>((set, get) => {
     stopReasoningBufferTimer(bufferKey);
     reasoningBuffers.delete(bufferKey);
 
-    const mergedContent = pending.chunks.join("").trim();
+    const mergedContent = pending.content.trim();
     const message: ChatMessage = {
       ...pending.message,
       content: mergedContent.length > 0 ? mergedContent : pending.message.content
@@ -578,14 +590,14 @@ export const useAppStore = create<AppStore>((set, get) => {
       existing ??
       {
         message: { ...message, content: "" },
-        chunks: [],
+        content: "",
         startedAtMs: nowMs,
         timer: null
       };
 
     pending.message = { ...pending.message, ...message, content: pending.message.content };
     if (message.content.length > 0) {
-      pending.chunks.push(message.content);
+      pending.content = appendStreamingChunk(pending.content, message.content);
     }
     reasoningBuffers.set(bufferKey, pending);
 
@@ -633,7 +645,7 @@ export const useAppStore = create<AppStore>((set, get) => {
         continue;
       }
 
-      const bufferedText = normalizeMessageText(pending.chunks.join(""));
+      const bufferedText = normalizeMessageText(pending.content);
       if (bufferedText.length === 0) {
         continue;
       }
@@ -1200,6 +1212,11 @@ export const useAppStore = create<AppStore>((set, get) => {
 export const shutdownRpcClients = (): void => {
   setNotificationSink(null);
   closeAllClients();
+};
+
+export const __TEST_ONLY__ = {
+  upsertMessage,
+  hasAcknowledgedEquivalent
 };
 
 const toErrorMessage = (error: unknown): string => {
