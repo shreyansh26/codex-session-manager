@@ -21,12 +21,21 @@ describe("buildTurnStartAttempts", () => {
   it("does not include text-only fallback attempts when images are attached", () => {
     const submission: ComposerSubmission = {
       prompt: "What does this image show?",
-      images: [sampleImage("data:image/png;base64,abc123")]
+      images: [sampleImage("data:image/png;base64,abc123")],
+      model: "gpt-5.3-codex",
+      thinkingEffort: "high"
     };
 
     const attempts = buildTurnStartAttempts("thread-1", submission);
     expect(attempts.length).toBeGreaterThan(0);
     expect(hasStringInputFallback(attempts)).toBe(false);
+    expect(
+      attempts.every(
+        (attempt) =>
+          attempt.model === "gpt-5.3-codex" &&
+          JSON.stringify(attempt.reasoning) === JSON.stringify({ effort: "high" })
+      )
+    ).toBe(true);
 
     const serializedInputs = attempts
       .map((attempt) => JSON.stringify(attempt.input))
@@ -40,7 +49,9 @@ describe("buildTurnStartAttempts", () => {
   it("keeps legacy string fallback for text-only submissions", () => {
     const attempts = buildTurnStartAttempts("thread-2", {
       prompt: "Hello",
-      images: []
+      images: [],
+      model: "gpt-5.2",
+      thinkingEffort: "xhigh"
     });
 
     expect(attempts.length).toBeGreaterThan(0);
@@ -50,12 +61,21 @@ describe("buildTurnStartAttempts", () => {
       true
     );
     expect(attempts.some((attempt) => "thread_id" in attempt)).toBe(false);
+    expect(
+      attempts.every(
+        (attempt) =>
+          attempt.model === "gpt-5.2" &&
+          JSON.stringify(attempt.reasoning) === JSON.stringify({ effort: "xhigh" })
+      )
+    ).toBe(true);
   });
 
   it("supports image-only submissions without introducing string fallbacks", () => {
     const attempts = buildTurnStartAttempts("thread-3", {
       prompt: "",
-      images: [sampleImage("data:image/png;base64,def456")]
+      images: [sampleImage("data:image/png;base64,def456")],
+      model: "gpt-5.1-codex-mini",
+      thinkingEffort: "medium"
     });
 
     expect(attempts.length).toBeGreaterThan(0);
@@ -68,6 +88,13 @@ describe("buildTurnStartAttempts", () => {
     expect(attempts.every((attempt) => typeof attempt.threadId === "string")).toBe(
       true
     );
+    expect(
+      attempts.every(
+        (attempt) =>
+          attempt.model === "gpt-5.1-codex-mini" &&
+          JSON.stringify(attempt.reasoning) === JSON.stringify({ effort: "medium" })
+      )
+    ).toBe(true);
   });
 });
 

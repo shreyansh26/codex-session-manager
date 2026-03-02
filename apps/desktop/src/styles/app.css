@@ -724,6 +724,38 @@
   border-color: color-mix(in srgb, var(--accent) 50%, var(--line));
 }
 
+.composer__selectors {
+  margin-top: 0.6rem;
+  display: flex;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+}
+
+.composer__selector {
+  min-width: 0;
+  display: grid;
+  gap: 0.28rem;
+}
+
+.composer__selector span {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+}
+
+.composer__selector select {
+  min-width: 180px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: rgba(7, 9, 12, 0.8);
+  color: inherit;
+  padding: 0.38rem 0.5rem;
+}
+
+.composer__selector select:focus {
+  outline: 1px solid color-mix(in srgb, var(--accent) 60%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--line));
+}
+
 .composer__actions {
   margin-top: 0.55rem;
   display: flex;

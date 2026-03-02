@@ -1,4 +1,10 @@
 import { makeSessionKey } from "../domain/sessionKey";
+import {
+  normalizeCatalogModelId,
+  resolveComposerModel,
+  resolveSupportedModelId,
+  resolveThinkingEffortForModel
+} from "../domain/modelCatalog";
 import type {
   ChatImageAttachment,
   ChatMessage,
@@ -189,6 +195,66 @@ export const listThreads = async (device: DeviceRecord): Promise<SessionSummary[
   return [...collected.values()].sort(
     (a, b) => parseTimestampMs(b.updatedAt) - parseTimestampMs(a.updatedAt)
   );
+};
+
+export const listModels = async (device: DeviceRecord): Promise<string[]> => {
+  const client = await ensureInitialized(device);
+  const collected = new Set<string>();
+  let cursor: string | null = null;
+
+  for (let page = 0; page < 20; page += 1) {
+    const result = await callWithFallback(client, "model/list", [
+      { limit: 200, ...(cursor ? { cursor } : {}) },
+      cursor ? { cursor } : undefined,
+      {}
+    ]);
+    const envelope = asRecord(result);
+    const rawModels = ensureArray(
+      envelope?.data ?? envelope?.models ?? envelope?.items ?? result
+    );
+
+    for (const rawModel of rawModels) {
+      if (typeof rawModel === "string") {
+        const normalized = normalizeCatalogModelId(rawModel);
+        if (normalized) {
+          collected.add(normalized);
+        }
+        continue;
+      }
+
+      const record = asRecord(rawModel);
+      if (!record) {
+        continue;
+      }
+
+      const candidate =
+        pickString(record, [
+          "id",
+          "model",
+          "modelId",
+          "model_id",
+          "name",
+          "slug",
+          "modelName",
+          "model_name"
+        ]) ?? pickThreadModel(record);
+      const normalized = normalizeCatalogModelId(candidate);
+      if (normalized) {
+        collected.add(normalized);
+      }
+    }
+
+    const pagination = asRecord(envelope?.pagination);
+    const nextCursor =
+      pickString(envelope, ["nextCursor", "next_cursor"]) ??
+      pickString(pagination, ["nextCursor", "next_cursor"]);
+    if (!nextCursor || nextCursor === cursor) {
+      break;
+    }
+    cursor = nextCursor;
+  }
+
+  return [...collected];
 };
 
 export const readThread = async (
@@ -424,17 +490,29 @@ export const buildTurnStartAttempts = (
   const normalizedPrompt = submission.prompt.trim();
   const normalizedImages = normalizeOutgoingImages(submission.images);
   const hasImages = normalizedImages.length > 0;
+  const selectedModel = resolveComposerModel(submission.model);
+  const selectedEffort = resolveThinkingEffortForModel(
+    selectedModel,
+    submission.thinkingEffort
+  );
+  const resolvedModelForPayload =
+    resolveSupportedModelId(selectedModel) ?? selectedModel;
+  const requestBaseParams = {
+    threadId,
+    model: resolvedModelForPayload,
+    reasoning: { effort: selectedEffort }
+  };
 
   const sequenceShapes = buildTurnInputShapes(normalizedPrompt, normalizedImages);
 
   const attempts: Array<Record<string, unknown>> = [];
   for (const input of sequenceShapes) {
-    attempts.push({ threadId, input });
+    attempts.push({ ...requestBaseParams, input });
   }
 
   // Keep legacy fallbacks for older app-server variants.
   if (!hasImages && normalizedPrompt.length > 0) {
-    attempts.push({ threadId, input: normalizedPrompt });
+    attempts.push({ ...requestBaseParams, input: normalizedPrompt });
   }
 
   return attempts;

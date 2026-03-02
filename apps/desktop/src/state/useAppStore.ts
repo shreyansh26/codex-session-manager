@@ -1,7 +1,13 @@
 import { create } from "zustand";
+import {
+  resolveComposerModel,
+  resolveThinkingEffortForModel,
+  resolveSupportedModelId
+} from "../domain/modelCatalog";
 import { makeSessionKey } from "../domain/sessionKey";
 import type {
   ChatMessage,
+  ComposerPreference,
   ComposerSubmission,
   DirectoryBrowseResult,
   DeviceAddSshRequest,
@@ -9,6 +15,7 @@ import type {
   NewSessionRequest,
   RpcNotification,
   SessionSummary,
+  ThinkingEffort,
   TokenUsageBreakdown,
   ThreadTokenUsageState
 } from "../domain/types";
@@ -16,6 +23,7 @@ import {
   closeAllClients,
   closeDeviceClient,
   listDirectories,
+  listModels,
   listThreads,
   readThreadUsageFromRollout,
   readAccount,
@@ -50,6 +58,8 @@ interface AppStore {
   tokenUsageBySession: Record<string, ThreadTokenUsageState>;
   modelBySession: Record<string, string>;
   costUsdBySession: Record<string, number | null>;
+  availableModelsByDevice: Record<string, string[]>;
+  composerPrefsBySession: Record<string, ComposerPreference>;
   globalError: string | null;
   initializing: boolean;
   initialize: () => Promise<void>;
@@ -67,6 +77,8 @@ interface AppStore {
   ) => Promise<DirectoryBrowseResult>;
   startNewSession: (request: NewSessionRequest) => Promise<string | null>;
   submitComposer: (submission: ComposerSubmission) => Promise<void>;
+  setComposerModel: (sessionKey: string, model: string) => void;
+  setComposerThinkingEffort: (sessionKey: string, effort: ThinkingEffort) => void;
   addSsh: (request: DeviceAddSshRequest) => Promise<void>;
   connect: (deviceId: string) => Promise<void>;
   disconnect: (deviceId: string) => Promise<void>;
@@ -488,6 +500,42 @@ const normalizeSubmissionImages = (
       url: image.url.trim()
     }));
 
+const toComposerPreference = (params: {
+  model: string | undefined;
+  effort: ThinkingEffort | undefined;
+}): ComposerPreference => {
+  const model = resolveComposerModel(params.model);
+  return {
+    model,
+    thinkingEffort: resolveThinkingEffortForModel(model, params.effort)
+  };
+};
+
+const upsertComposerPreference = (
+  current: Record<string, ComposerPreference>,
+  sessionKey: string,
+  model: string | undefined,
+  effort: ThinkingEffort | undefined
+): Record<string, ComposerPreference> => {
+  const previous = current[sessionKey];
+  const next = toComposerPreference({
+    model: model ?? previous?.model,
+    effort: effort ?? previous?.thinkingEffort
+  });
+  if (
+    previous &&
+    previous.model === next.model &&
+    previous.thinkingEffort === next.thinkingEffort
+  ) {
+    return current;
+  }
+
+  return {
+    ...current,
+    [sessionKey]: next
+  };
+};
+
 const findLocalDevice = (devices: DeviceRecord[]): DeviceRecord | null =>
   devices.find((device) => device.config.kind === "local") ?? null;
 
@@ -672,6 +720,66 @@ export const useAppStore = create<AppStore>((set, get) => {
         usageBackfillAtMsBySession.delete(sessionKey);
       }
     }
+  };
+
+  const refreshAvailableModelsForDevice = (deviceId: string): void => {
+    void (async () => {
+      const snapshot = get();
+      const device = snapshot.devices.find((entry) => entry.id === deviceId);
+      if (!device || !device.connected) {
+        return;
+      }
+
+      try {
+        const rawAvailableModels = await listModels(device);
+        const normalized = [...new Set(
+          rawAvailableModels
+            .map((modelId) => resolveSupportedModelId(modelId))
+            .filter((modelId): modelId is string => modelId !== null)
+        )];
+        if (normalized.length === 0) {
+          return;
+        }
+
+        set((state) => {
+          const previous = state.availableModelsByDevice[deviceId] ?? null;
+          if (
+            previous &&
+            previous.length === normalized.length &&
+            previous.every((entry, index) => entry === normalized[index])
+          ) {
+            return {};
+          }
+
+          return {
+            availableModelsByDevice: {
+              ...state.availableModelsByDevice,
+              [deviceId]: normalized
+            }
+          };
+        });
+      } catch {
+        // Keep current availability state if model listing fails.
+      }
+    })();
+  };
+
+  const ensureComposerPreferenceForSession = (sessionKey: string): void => {
+    set((state) => {
+      const nextComposerPrefs = upsertComposerPreference(
+        state.composerPrefsBySession,
+        sessionKey,
+        undefined,
+        undefined
+      );
+      if (nextComposerPrefs === state.composerPrefsBySession) {
+        return {};
+      }
+
+      return {
+        composerPrefsBySession: nextComposerPrefs
+      };
+    });
   };
 
   const startPostSendRefreshBurst = (params: {
@@ -967,6 +1075,8 @@ export const useAppStore = create<AppStore>((set, get) => {
     tokenUsageBySession: {},
     modelBySession: {},
     costUsdBySession: {},
+    availableModelsByDevice: {},
+    composerPrefsBySession: {},
     globalError: null,
     initialize: async () => {
       if (get().initializing) {
@@ -1016,6 +1126,7 @@ export const useAppStore = create<AppStore>((set, get) => {
           if (device.connected) {
             try {
               await ensureDeviceConnected(device);
+              refreshAvailableModelsForDevice(device.id);
             } catch (error) {
               const message = toErrorMessage(error);
               set((state) => ({
@@ -1036,6 +1147,7 @@ export const useAppStore = create<AppStore>((set, get) => {
     },
     selectSession: async (sessionKey) => {
       set({ selectedSessionKey: sessionKey });
+      ensureComposerPreferenceForSession(sessionKey);
       const selected = get().sessions.find((session) => session.key === sessionKey);
       if (!selected) {
         return;
@@ -1058,6 +1170,7 @@ export const useAppStore = create<AppStore>((set, get) => {
           await ensureDeviceConnected(device);
           const threads = await listThreads(device);
           sessionBuckets.push(...threads);
+          refreshAvailableModelsForDevice(device.id);
           set((state) => ({
             devices: state.devices.map((entry) =>
               entry.id === device.id ? { ...entry, lastError: undefined } : entry
@@ -1094,6 +1207,7 @@ export const useAppStore = create<AppStore>((set, get) => {
 
       const selected = get().selectedSessionKey;
       if (selected) {
+        ensureComposerPreferenceForSession(selected);
         const session = get().sessions.find((entry) => entry.key === selected);
         if (session) {
           await get().refreshThread(session.deviceId, session.threadId, {
@@ -1120,6 +1234,7 @@ export const useAppStore = create<AppStore>((set, get) => {
       try {
         await ensureDeviceConnected(device);
         const threads = await listThreads(device);
+        refreshAvailableModelsForDevice(deviceId);
         set((state) => {
           const incomingKeys = new Set(threads.map((session) => session.key));
           const otherDevices = state.sessions.filter(
@@ -1148,6 +1263,11 @@ export const useAppStore = create<AppStore>((set, get) => {
             )
           };
         });
+
+        const selected = get().selectedSessionKey;
+        if (selected) {
+          ensureComposerPreferenceForSession(selected);
+        }
 
         const hydrationCandidates = get()
           .sessions.filter(
@@ -1198,7 +1318,6 @@ export const useAppStore = create<AppStore>((set, get) => {
                 )
               }
             : state.costUsdBySession;
-
           return {
             sessions: nextSessions,
             modelBySession: nextModelBySession,
@@ -1267,6 +1386,12 @@ export const useAppStore = create<AppStore>((set, get) => {
             payload.messages
           )
         },
+        composerPrefsBySession: upsertComposerPreference(
+          state.composerPrefsBySession,
+          payload.session.key,
+          undefined,
+          undefined
+        ),
         globalError: null
       }));
 
@@ -1279,6 +1404,11 @@ export const useAppStore = create<AppStore>((set, get) => {
       );
       const prompt = submissionInput.prompt.trim();
       const images = normalizeSubmissionImages(submissionInput.images);
+      const model = resolveComposerModel(submissionInput.model);
+      const thinkingEffort = resolveThinkingEffortForModel(
+        model,
+        submissionInput.thinkingEffort
+      );
       if (!session || (prompt.length === 0 && images.length === 0)) {
         return;
       }
@@ -1318,6 +1448,12 @@ export const useAppStore = create<AppStore>((set, get) => {
             optimisticUserMessage
           )
         },
+        composerPrefsBySession: upsertComposerPreference(
+          prev.composerPrefsBySession,
+          session.key,
+          model,
+          thinkingEffort
+        ),
         globalError: null
       }));
 
@@ -1357,13 +1493,52 @@ export const useAppStore = create<AppStore>((set, get) => {
 
           await startTurn(device, threadId, {
             prompt,
-            images
+            images,
+            model,
+            thinkingEffort
           });
         } catch (error) {
           stopPostSendRefresh(session.key);
           set({ globalError: toErrorMessage(error) });
         }
       })();
+    },
+    setComposerModel: (sessionKey, model) => {
+      set((state) => {
+        const nextComposerPrefs = upsertComposerPreference(
+          state.composerPrefsBySession,
+          sessionKey,
+          model,
+          undefined
+        );
+        if (nextComposerPrefs === state.composerPrefsBySession) {
+          return {};
+        }
+
+        return {
+          composerPrefsBySession: nextComposerPrefs
+        };
+      });
+    },
+    setComposerThinkingEffort: (sessionKey, effort) => {
+      set((state) => {
+        const sessionModel =
+          state.composerPrefsBySession[sessionKey]?.model ??
+          state.modelBySession[sessionKey];
+        const nextComposerPrefs = upsertComposerPreference(
+          state.composerPrefsBySession,
+          sessionKey,
+          sessionModel,
+          effort
+        );
+        if (nextComposerPrefs === state.composerPrefsBySession) {
+          return {};
+        }
+
+        return {
+          composerPrefsBySession: nextComposerPrefs
+        };
+      });
     },
     addSsh: async (request) => {
       try {
@@ -1385,6 +1560,7 @@ export const useAppStore = create<AppStore>((set, get) => {
           devices: upsertDevice(state.devices, connected),
           globalError: null
         }));
+        refreshAvailableModelsForDevice(deviceId);
         await get().refreshDeviceSessions(deviceId);
       } catch (error) {
         set({ globalError: toErrorMessage(error) });
@@ -1445,6 +1621,16 @@ export const useAppStore = create<AppStore>((set, get) => {
               ([key]) => !key.startsWith(`${deviceId}::`)
             )
           );
+          const composerPrefsBySession = Object.fromEntries(
+            Object.entries(state.composerPrefsBySession).filter(
+              ([key]) => !key.startsWith(`${deviceId}::`)
+            )
+          );
+          const availableModelsByDevice = Object.fromEntries(
+            Object.entries(state.availableModelsByDevice).filter(
+              ([id]) => id !== deviceId
+            )
+          );
 
           return {
             devices,
@@ -1453,6 +1639,8 @@ export const useAppStore = create<AppStore>((set, get) => {
             modelBySession,
             tokenUsageBySession,
             costUsdBySession,
+            composerPrefsBySession,
+            availableModelsByDevice,
             selectedSessionKey: pickSelectedSession(state.selectedSessionKey, sessions)
           };
         });
@@ -1475,6 +1663,8 @@ export const __TEST_ONLY__ = {
   upsertMessage,
   mergeThreadMessages,
   hasAcknowledgedEquivalent,
+  toComposerPreference,
+  upsertComposerPreference,
   computeSessionCostUsd,
   makeUsageDeltaEventKey,
   accumulateSessionCostFromLast
