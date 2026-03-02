@@ -2,7 +2,9 @@ import type {
   ChatImageAttachment,
   ChatMessage,
   ChatRole,
-  RpcNotification
+  RpcNotification,
+  ThreadTokenUsage,
+  TokenUsageBreakdown
 } from "../domain/types";
 
 export interface ParsedMessageEvent {
@@ -12,6 +14,17 @@ export interface ParsedMessageEvent {
 }
 
 export type ParsedRpcEvent = ParsedMessageEvent;
+
+export interface ParsedThreadTokenUsageEvent {
+  threadId: string;
+  turnId?: string;
+  tokenUsage: ThreadTokenUsage;
+}
+
+export interface ParsedThreadModelEvent {
+  threadId: string;
+  model: string;
+}
 
 const normalizeMethod = (method: string): string => method.replaceAll(".", "/");
 
@@ -130,7 +143,7 @@ export const parseRpcNotification = (
     return null;
   }
   const isDeltaMethod = method.toLowerCase().includes("delta");
-  if (isDeltaMethod && payload.eventType !== "reasoning") {
+  if (isDeltaMethod) {
     return null;
   }
   const images = extractImageAttachments(item);
@@ -139,12 +152,12 @@ export const parseRpcNotification = (
     pickString(item, [
       "completedAt",
       "completed_at",
+      "updatedAt",
+      "updated_at",
       "createdAt",
       "created_at",
       "startedAt",
-      "started_at",
-      "updatedAt",
-      "updated_at"
+      "started_at"
     ]) ?? new Date().toISOString();
 
   const createdAt = normalizeTimestamp(createdAtRaw);
@@ -176,6 +189,230 @@ export const parseRpcNotification = (
       ...(payload.eventType ? { eventType: payload.eventType } : {})
     }
   };
+};
+
+export const parseThreadTokenUsageNotification = (
+  notification: RpcNotification,
+  fallbackThreadId?: string
+): ParsedThreadTokenUsageEvent | null => {
+  const params = notification.params;
+  const tokenUsageRecord = findNestedTokenUsageContainer(params);
+  if (!tokenUsageRecord) {
+    return null;
+  }
+  const method = normalizeMethod(notification.method).toLowerCase();
+  const eventTypeHint = normalizeEventType(
+    pickStringDeep(params, ["type", "eventType", "event_type", "kind"]) ??
+      pickStringDeep(params, ["msgType", "msg_type"])
+  );
+
+  const threadId =
+    pickStringDeep(params, [
+      "threadId",
+      "thread_id",
+      "sessionId",
+      "session_id",
+      "conversationId",
+      "conversation_id"
+    ]) ??
+    pickStringFromNamedRecordDeep(params, ["thread", "session", "conversation"], [
+      "id",
+      "threadId",
+      "thread_id",
+      "sessionId",
+      "session_id"
+    ]) ??
+    fallbackThreadId ??
+    null;
+  const paramsRecord = asRecord(params);
+  const turnId =
+    pickStringDeep(params, ["turnId", "turn_id", "taskId", "task_id"]) ??
+    pickStringFromNamedRecordDeep(params, ["turn", "task"], [
+      "id",
+      "turnId",
+      "turn_id",
+      "taskId",
+      "task_id"
+    ]) ??
+    ((methodMatches(method, "token_count", "token/count") ||
+      eventTypeHint === "token_count")
+      ? pickString(paramsRecord, ["id", "turnId", "turn_id"])
+      : null) ??
+    undefined;
+  if (!threadId || !tokenUsageRecord) {
+    return null;
+  }
+
+  const total =
+    parseTokenUsageBreakdown(tokenUsageRecord.total) ??
+    parseTokenUsageBreakdown(tokenUsageRecord.total_usage) ??
+    parseTokenUsageBreakdown(tokenUsageRecord.totalTokenUsage) ??
+    parseTokenUsageBreakdown(tokenUsageRecord.total_token_usage);
+  const last =
+    parseTokenUsageBreakdown(tokenUsageRecord.last) ??
+    parseTokenUsageBreakdown(tokenUsageRecord.last_usage) ??
+    parseTokenUsageBreakdown(tokenUsageRecord.lastTokenUsage) ??
+    parseTokenUsageBreakdown(tokenUsageRecord.last_token_usage);
+
+  if (!total && !last) {
+    return null;
+  }
+  const normalizedTotal = total ?? last!;
+  const normalizedLast = last ?? total!;
+
+  const modelContextWindow =
+    pickNumberDeep(tokenUsageRecord, [
+      "modelContextWindow",
+      "model_context_window",
+      "modelContextWindowTokens",
+      "model_context_window_tokens"
+    ]) ??
+    pickNumberDeep(params, [
+      "modelContextWindow",
+      "model_context_window",
+      "modelContextWindowTokens",
+      "model_context_window_tokens"
+    ]) ??
+    null;
+
+  return {
+    threadId,
+    ...(turnId ? { turnId } : {}),
+    tokenUsage: {
+      total: normalizedTotal,
+      last: normalizedLast,
+      modelContextWindow
+    }
+  };
+};
+
+export const parseThreadModelNotification = (
+  notification: RpcNotification
+): ParsedThreadModelEvent | null => {
+  const method = normalizeMethod(notification.method).toLowerCase();
+  const params = asRecord(notification.params);
+  if (!params) {
+    return null;
+  }
+
+  const msgRecord = asRecord(params.msg);
+  const eventTypeHint = normalizeEventType(
+    pickString(params, ["type", "eventType", "event_type", "kind"]) ??
+      pickString(msgRecord, ["type", "eventType", "event_type", "kind"])
+  );
+
+  if (
+    methodMatches(method, "sessionconfigured", "session/configured", "session_configured") ||
+    eventTypeHint === "session_configured"
+  ) {
+    const threadId =
+      pickStringDeep(params, [
+        "threadId",
+        "thread_id",
+        "sessionId",
+        "session_id",
+        "conversationId",
+        "conversation_id"
+      ]) ??
+      pickStringDeep(msgRecord, [
+        "threadId",
+        "thread_id",
+        "sessionId",
+        "session_id",
+        "conversationId",
+        "conversation_id"
+      ]);
+    const model =
+      pickStringDeep(params, ["model", "modelId", "model_id", "toModel", "to_model"]) ??
+      pickStringDeep(msgRecord, ["model", "modelId", "model_id", "toModel", "to_model"]);
+    if (threadId && model) {
+      return { threadId, model };
+    }
+    return null;
+  }
+
+  if (
+    methodMatches(method, "model/rerouted", "model/reroute", "model_reroute") ||
+    eventTypeHint === "model_reroute"
+  ) {
+    const threadId =
+      pickStringDeep(params, [
+        "threadId",
+        "thread_id",
+        "sessionId",
+        "session_id",
+        "conversationId",
+        "conversation_id"
+      ]) ??
+      pickStringDeep(msgRecord, [
+        "threadId",
+        "thread_id",
+        "sessionId",
+        "session_id",
+        "conversationId",
+        "conversation_id"
+      ]);
+    const model =
+      pickStringDeep(params, ["toModel", "to_model", "model", "modelId", "model_id"]) ??
+      pickStringDeep(msgRecord, ["toModel", "to_model", "model", "modelId", "model_id"]);
+    if (threadId && model) {
+      return { threadId, model };
+    }
+    return null;
+  }
+
+  const threadId =
+    pickString(params, ["threadId", "thread_id", "sessionId", "session_id"]) ??
+    pickString(params, ["conversationId", "conversation_id"]) ??
+    pickString(msgRecord, ["threadId", "thread_id", "sessionId", "session_id"]) ??
+    pickString(msgRecord, ["conversationId", "conversation_id"]) ??
+    pickString(asRecord(params.turn), ["threadId", "thread_id", "sessionId", "session_id"]) ??
+    pickString(asRecord(params.message), ["threadId", "thread_id", "sessionId", "session_id"]) ??
+    pickString(asRecord(params.item), ["threadId", "thread_id", "sessionId", "session_id"]) ??
+    pickString(asRecord(msgRecord?.turn), ["threadId", "thread_id", "sessionId", "session_id"]) ??
+    pickString(asRecord(msgRecord?.message), [
+      "threadId",
+      "thread_id",
+      "sessionId",
+      "session_id"
+    ]) ??
+    pickString(asRecord(msgRecord?.item), ["threadId", "thread_id", "sessionId", "session_id"]);
+  if (!threadId) {
+    return null;
+  }
+
+  const model =
+    pickString(params, ["toModel", "to_model", "model", "modelId", "model_id"]) ??
+    pickString(msgRecord, ["toModel", "to_model", "model", "modelId", "model_id"]) ??
+    pickString(asRecord(params.turn), ["toModel", "to_model", "model", "modelId", "model_id"]) ??
+    pickString(asRecord(params.message), ["toModel", "to_model", "model", "modelId", "model_id"]) ??
+    pickString(asRecord(params.item), ["toModel", "to_model", "model", "modelId", "model_id"]) ??
+    pickString(asRecord(msgRecord?.turn), [
+      "toModel",
+      "to_model",
+      "model",
+      "modelId",
+      "model_id"
+    ]) ??
+    pickString(asRecord(msgRecord?.message), [
+      "toModel",
+      "to_model",
+      "model",
+      "modelId",
+      "model_id"
+    ]) ??
+    pickString(asRecord(msgRecord?.item), [
+      "toModel",
+      "to_model",
+      "model",
+      "modelId",
+      "model_id"
+    ]);
+  if (!model) {
+    return null;
+  }
+
+  return { threadId, model };
 };
 
 export const extractItemMessagePayload = (
@@ -548,6 +785,127 @@ const normalizeTimestamp = (value: string): string | null => {
   return date.toISOString();
 };
 
+const methodMatches = (method: string, ...candidates: string[]): boolean =>
+  candidates.some((candidate) => method === candidate || method.endsWith(`/${candidate}`));
+
+const normalizeEventType = (value: string | null | undefined): string => {
+  if (!value) {
+    return "";
+  }
+  return value.trim().toLowerCase().replaceAll("/", "_").replaceAll(".", "_");
+};
+
+const parseTokenUsageBreakdown = (value: unknown): TokenUsageBreakdown | null => {
+  const record = asRecord(value);
+  if (!record) {
+    return null;
+  }
+
+  const totalTokensRaw = pickNumber(record, ["totalTokens", "total_tokens"]);
+  const inputTokensRaw = pickNumber(record, ["inputTokens", "input_tokens"]);
+  const cachedInputTokensRaw = pickNumber(record, ["cachedInputTokens", "cached_input_tokens"]);
+  const outputTokensRaw = pickNumber(record, ["outputTokens", "output_tokens"]);
+  const reasoningOutputTokensRaw = pickNumber(record, [
+    "reasoningOutputTokens",
+    "reasoning_output_tokens"
+  ]);
+  const hasAnyField =
+    totalTokensRaw !== null ||
+    inputTokensRaw !== null ||
+    cachedInputTokensRaw !== null ||
+    outputTokensRaw !== null ||
+    reasoningOutputTokensRaw !== null;
+  if (!hasAnyField) {
+    return null;
+  }
+
+  const inputTokens = Math.max(inputTokensRaw ?? 0, 0);
+  const cachedInputTokens = Math.max(cachedInputTokensRaw ?? 0, 0);
+  const outputTokens = Math.max(outputTokensRaw ?? 0, 0);
+  const reasoningOutputTokens = Math.max(reasoningOutputTokensRaw ?? 0, 0);
+  const totalTokens = Math.max(totalTokensRaw ?? inputTokens + outputTokens, 0);
+
+  return {
+    totalTokens,
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
+    reasoningOutputTokens
+  };
+};
+
+const findNestedTokenUsageContainer = (
+  input: unknown,
+  depth = 0
+): Record<string, unknown> | null => {
+  if (depth > 5) {
+    return null;
+  }
+
+  const record = asRecord(input);
+  if (record) {
+    if (isTokenUsageContainer(record)) {
+      return record;
+    }
+
+    const priorityKeys = [
+      "tokenUsage",
+      "token_usage",
+      "usage",
+      "info",
+      "event",
+      "payload",
+      "data"
+    ];
+    for (const key of priorityKeys) {
+      if (!(key in record)) {
+        continue;
+      }
+      const nested = findNestedTokenUsageContainer(record[key], depth + 1);
+      if (nested) {
+        return nested;
+      }
+    }
+
+    for (const nested of Object.values(record)) {
+      const found = findNestedTokenUsageContainer(nested, depth + 1);
+      if (found) {
+        return found;
+      }
+    }
+  }
+
+  if (Array.isArray(input)) {
+    for (const entry of input) {
+      const nested = findNestedTokenUsageContainer(entry, depth + 1);
+      if (nested) {
+        return nested;
+      }
+    }
+  }
+
+  return null;
+};
+
+const isTokenUsageContainer = (record: Record<string, unknown>): boolean => {
+  if (parseTokenUsageBreakdown(record) !== null) {
+    return true;
+  }
+
+  const totalCandidate =
+    parseTokenUsageBreakdown(record.total) ??
+    parseTokenUsageBreakdown(record.total_usage) ??
+    parseTokenUsageBreakdown(record.totalTokenUsage) ??
+    parseTokenUsageBreakdown(record.total_token_usage);
+  const lastCandidate =
+    parseTokenUsageBreakdown(record.last) ??
+    parseTokenUsageBreakdown(record.last_usage) ??
+    parseTokenUsageBreakdown(record.lastTokenUsage) ??
+    parseTokenUsageBreakdown(record.last_token_usage);
+
+  return totalCandidate !== null || lastCandidate !== null;
+};
+
 const asRecord = (value: unknown): Record<string, unknown> | null =>
   typeof value === "object" && value !== null ? (value as Record<string, unknown>) : null;
 
@@ -563,6 +921,100 @@ const pickString = (
     const candidate = value[key];
     if (typeof candidate === "string" && candidate.trim().length > 0) {
       return candidate;
+    }
+  }
+
+  return null;
+};
+
+const pickStringDeep = (
+  input: unknown,
+  keys: string[],
+  depth = 0
+): string | null => {
+  if (depth > 5) {
+    return null;
+  }
+
+  const record = asRecord(input);
+  if (record) {
+    const direct = pickString(record, keys);
+    if (direct) {
+      return direct;
+    }
+    for (const nested of Object.values(record)) {
+      const found = pickStringDeep(nested, keys, depth + 1);
+      if (found) {
+        return found;
+      }
+    }
+  }
+
+  if (Array.isArray(input)) {
+    for (const entry of input) {
+      const found = pickStringDeep(entry, keys, depth + 1);
+      if (found) {
+        return found;
+      }
+    }
+  }
+
+  return null;
+};
+
+const pickStringFromNamedRecordDeep = (
+  input: unknown,
+  recordKeys: string[],
+  valueKeys: string[],
+  depth = 0
+): string | null => {
+  if (depth > 5) {
+    return null;
+  }
+
+  const record = asRecord(input);
+  if (record) {
+    for (const recordKey of recordKeys) {
+      const nestedRecord = asRecord(record[recordKey]);
+      const candidate = pickString(nestedRecord, valueKeys);
+      if (candidate) {
+        return candidate;
+      }
+      const nestedCandidate = pickStringFromNamedRecordDeep(
+        nestedRecord,
+        recordKeys,
+        valueKeys,
+        depth + 1
+      );
+      if (nestedCandidate) {
+        return nestedCandidate;
+      }
+    }
+
+    for (const nested of Object.values(record)) {
+      const candidate = pickStringFromNamedRecordDeep(
+        nested,
+        recordKeys,
+        valueKeys,
+        depth + 1
+      );
+      if (candidate) {
+        return candidate;
+      }
+    }
+  }
+
+  if (Array.isArray(input)) {
+    for (const entry of input) {
+      const candidate = pickStringFromNamedRecordDeep(
+        entry,
+        recordKeys,
+        valueKeys,
+        depth + 1
+      );
+      if (candidate) {
+        return candidate;
+      }
     }
   }
 
@@ -586,6 +1038,41 @@ const pickNumber = (
       const parsed = Number(candidate);
       if (Number.isFinite(parsed)) {
         return parsed;
+      }
+    }
+  }
+
+  return null;
+};
+
+const pickNumberDeep = (
+  input: unknown,
+  keys: string[],
+  depth = 0
+): number | null => {
+  if (depth > 5) {
+    return null;
+  }
+
+  const record = asRecord(input);
+  if (record) {
+    const direct = pickNumber(record, keys);
+    if (direct !== null) {
+      return direct;
+    }
+    for (const nested of Object.values(record)) {
+      const found = pickNumberDeep(nested, keys, depth + 1);
+      if (found !== null) {
+        return found;
+      }
+    }
+  }
+
+  if (Array.isArray(input)) {
+    for (const entry of input) {
+      const found = pickNumberDeep(entry, keys, depth + 1);
+      if (found !== null) {
+        return found;
       }
     }
   }

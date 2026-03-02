@@ -522,10 +522,12 @@
   margin: 0.22rem 0 0;
 }
 
-.chat-panel__updated-at {
+.chat-panel__meta {
   margin: 0.26rem 0 0;
   font-size: 0.76rem;
   color: color-mix(in srgb, var(--text-muted) 90%, #dbe9ff);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 .chat-panel__address {

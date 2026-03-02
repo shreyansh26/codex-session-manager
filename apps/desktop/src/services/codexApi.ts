@@ -9,9 +9,14 @@ import type {
   DeviceRecord,
   RpcNotification,
   SessionSummary,
-  ThreadPayload
+  ThreadPayload,
+  ThreadTokenUsage
 } from "../domain/types";
-import { extractImageAttachments, extractItemMessagePayload } from "./eventParser";
+import {
+  extractImageAttachments,
+  extractItemMessagePayload,
+  parseThreadTokenUsageNotification
+} from "./eventParser";
 import { JsonRpcClient } from "./jsonRpcClient";
 
 type ClientState = {
@@ -20,6 +25,13 @@ type ClientState = {
   initialized: boolean;
   unsubscribe: (() => void) | null;
 };
+
+export interface ThreadUsageSnapshot {
+  threadId: string;
+  turnId?: string;
+  tokenUsage: ThreadTokenUsage;
+  model?: string;
+}
 
 const clients = new Map<string, ClientState>();
 
@@ -195,6 +207,7 @@ export const readThread = async (
   const baseTitle = deriveSessionBaseTitle(thread, threadId, preview);
   const cwd = pickString(thread, ["cwd", "workingDirectory", "working_directory"]);
   const folderName = folderNameFromPath(cwd);
+  const model = pickThreadModel(thread);
 
   const session: SessionSummary = {
     key: makeSessionKey(device.id, threadId),
@@ -219,31 +232,33 @@ export const readThread = async (
   session.preview = latest?.content?.trim() || session.preview;
   session.updatedAt = session.updatedAt || latest?.createdAt || "";
 
-  return { session, messages };
+  return {
+    session,
+    messages,
+    ...(model ? { model } : {})
+  };
 };
 
 export const resumeThread = async (
   device: DeviceRecord,
   threadId: string
-): Promise<void> => {
+): Promise<{ model?: string }> => {
   const client = await ensureInitialized(device);
-  await callWithFallback(client, "thread/resume", [{ threadId }]);
+  const result = await callWithFallback(client, "thread/resume", [{ threadId }]);
+  const record = asRecord(result);
+  const model =
+    pickString(record, ["model", "modelId", "model_id", "modelName", "model_name"]) ??
+    pickThreadModel(asRecord(record?.thread));
+  return model ? { model } : {};
 };
 
 export const startThread = async (
   device: DeviceRecord,
   cwd: string
-): Promise<{ threadId: string; cwd: string }> => {
+): Promise<{ threadId: string; cwd: string; model?: string }> => {
   const client = await ensureInitialized(device);
   const normalizedCwd = normalizePosixPath(cwd);
-  const result = await callWithFallback(client, "thread/start", [
-    {
-      cwd: normalizedCwd,
-      experimentalRawEvents: false,
-      persistExtendedHistory: true
-    },
-    { cwd: normalizedCwd }
-  ]);
+  const result = await callWithFallback(client, "thread/start", [{ cwd: normalizedCwd }]);
 
   const record = asRecord(result);
   const thread = asRecord(record?.thread);
@@ -258,10 +273,14 @@ export const startThread = async (
     pickString(record, ["cwd", "workingDirectory", "working_directory"]) ??
     pickString(thread, ["cwd", "workingDirectory", "working_directory"]) ??
     normalizedCwd;
+  const model =
+    pickString(record, ["model", "modelId", "model_id", "modelName", "model_name"]) ??
+    pickThreadModel(thread);
 
   return {
     threadId,
-    cwd: normalizePosixPath(resolvedCwd)
+    cwd: normalizePosixPath(resolvedCwd),
+    ...(model ? { model } : {})
   };
 };
 
@@ -295,6 +314,89 @@ export const listDirectories = async (
   return {
     cwd: normalizedCwd,
     entries: parseLsDirectoryEntries(stdout, normalizedCwd)
+  };
+};
+
+export const readThreadUsageFromRollout = async (
+  device: DeviceRecord,
+  threadId: string
+): Promise<ThreadUsageSnapshot | null> => {
+  // Thread ids are generated UUID-like identifiers. Skip fallback for unexpected input.
+  if (!/^[A-Za-z0-9-]+$/.test(threadId)) {
+    return null;
+  }
+
+  const client = await ensureInitialized(device);
+  const result = await client.call<unknown>("command/exec", {
+    command: [
+      "sh",
+      "-lc",
+      [
+        'root="${HOME}/.codex/sessions"',
+        '[ -d "$root" ] || exit 0',
+        `match="$(find "$root" -type f -name '*${threadId}.jsonl' 2>/dev/null | LC_ALL=C sort | tail -n 1)"`,
+        '[ -n "$match" ] || exit 0',
+        'line="$(grep -F \'"type":"token_count"\' "$match" | tail -n 1 || true)"',
+        'printf "%s" "$line"'
+      ].join("; ")
+    ],
+    cwd: "."
+  });
+
+  const response = asRecord(result);
+  const exitCodeRaw = response?.exitCode ?? response?.exit_code;
+  const exitCode =
+    typeof exitCodeRaw === "number"
+      ? exitCodeRaw
+      : typeof exitCodeRaw === "string"
+        ? Number.parseInt(exitCodeRaw, 10)
+        : 0;
+  if (!Number.isFinite(exitCode) || exitCode !== 0) {
+    return null;
+  }
+
+  const stdout = typeof response?.stdout === "string" ? response.stdout.trim() : "";
+  if (stdout.length === 0) {
+    return null;
+  }
+
+  const lastLine = stdout.split(/\r?\n/).at(-1)?.trim() ?? "";
+  if (lastLine.length === 0) {
+    return null;
+  }
+
+  let parsedLine: unknown;
+  try {
+    parsedLine = JSON.parse(lastLine);
+  } catch {
+    return null;
+  }
+
+  const parsedRecord = asRecord(parsedLine);
+  const payload = asRecord(parsedRecord?.payload) ?? parsedRecord;
+  if (!payload) {
+    return null;
+  }
+
+  const usageEvent = parseThreadTokenUsageNotification({
+    method: "rollout/token_count",
+    params: {
+      threadId,
+      msg: payload
+    }
+  });
+  if (!usageEvent) {
+    return null;
+  }
+
+  const limitName = pickString(asRecord(payload.rate_limits), ["limit_name", "limitName"]);
+  const normalizedModel = normalizeModelFromLimitName(limitName);
+
+  return {
+    threadId: usageEvent.threadId,
+    ...(usageEvent.turnId ? { turnId: usageEvent.turnId } : {}),
+    tokenUsage: usageEvent.tokenUsage,
+    ...(normalizedModel ? { model: normalizedModel } : {})
   };
 };
 
@@ -932,6 +1034,50 @@ const deriveSessionBaseTitle = (
     return threadId;
   }
   return normalized;
+};
+
+const pickThreadModel = (
+  value: Record<string, unknown> | null | undefined,
+  depth = 0
+): string | null => {
+  if (!value || depth > 2) {
+    return null;
+  }
+
+  const direct = pickString(value, ["model", "modelId", "model_id", "modelName", "model_name"]);
+  if (direct) {
+    return direct;
+  }
+
+  const nestedCandidates = [
+    "config",
+    "settings",
+    "metadata",
+    "modelInfo",
+    "model_info",
+    "turn",
+    "lastTurn",
+    "last_turn",
+    "latestMessage",
+    "latest_message"
+  ];
+  for (const key of nestedCandidates) {
+    const nested = asRecord(value[key]);
+    const nestedModel = pickThreadModel(nested, depth + 1);
+    if (nestedModel) {
+      return nestedModel;
+    }
+  }
+
+  return null;
+};
+
+const normalizeModelFromLimitName = (value: string | null): string | null => {
+  if (!value) {
+    return null;
+  }
+  const normalized = value.trim().toLowerCase().replace(/\s+/g, "-");
+  return normalized.length > 0 ? normalized : null;
 };
 
 const truncateForPreview = (value: string): string => {

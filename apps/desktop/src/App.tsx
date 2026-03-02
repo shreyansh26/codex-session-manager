@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import ChatPanel from "./components/ChatPanel";
 import Composer from "./components/Composer";
 import Sidebar from "./components/Sidebar";
+import type { SessionCostDisplay } from "./domain/types";
 import { shutdownRpcClients, useAppStore } from "./state/useAppStore";
 
 const REFRESH_INTERVAL_MS = 20_000;
@@ -11,6 +12,31 @@ const SIDEBAR_MAX_RATIO = 0.62;
 const clampSidebarWidth = (requested: number, shellWidth: number): number => {
   const maxWidth = Math.max(SIDEBAR_MIN_WIDTH_PX, Math.floor(shellWidth * SIDEBAR_MAX_RATIO));
   return Math.min(Math.max(requested, SIDEBAR_MIN_WIDTH_PX), maxWidth);
+};
+
+const pickThreadScopedValue = <T,>(
+  values: Record<string, T>,
+  selectedSessionKey: string | null,
+  threadId: string | undefined
+): T | undefined => {
+  if (selectedSessionKey) {
+    const direct = values[selectedSessionKey];
+    if (direct !== undefined) {
+      return direct;
+    }
+  }
+
+  if (!threadId) {
+    return undefined;
+  }
+
+  for (const [key, value] of Object.entries(values)) {
+    if (key.endsWith(`::${threadId}`)) {
+      return value;
+    }
+  }
+
+  return undefined;
 };
 
 export default function App() {
@@ -25,6 +51,9 @@ export default function App() {
   const sessions = useAppStore((state) => state.sessions);
   const selectedSessionKey = useAppStore((state) => state.selectedSessionKey);
   const messagesBySession = useAppStore((state) => state.messagesBySession);
+  const tokenUsageBySession = useAppStore((state) => state.tokenUsageBySession);
+  const modelBySession = useAppStore((state) => state.modelBySession);
+  const costUsdBySession = useAppStore((state) => state.costUsdBySession);
   const globalError = useAppStore((state) => state.globalError);
 
   const initialize = useAppStore((state) => state.initialize);
@@ -106,6 +135,32 @@ export default function App() {
   );
 
   const messages = selectedSessionKey ? messagesBySession[selectedSessionKey] ?? [] : [];
+  const costDisplay: SessionCostDisplay = useMemo(() => {
+    if (!selectedSessionKey) {
+      return { costAvailable: false };
+    }
+
+    const threadId = selectedSession?.threadId;
+    const model = pickThreadScopedValue(modelBySession, selectedSessionKey, threadId);
+    const tokenUsage = pickThreadScopedValue(
+      tokenUsageBySession,
+      selectedSessionKey,
+      threadId
+    );
+    const usdCost = pickThreadScopedValue(costUsdBySession, selectedSessionKey, threadId);
+    return {
+      ...(model ? { model } : {}),
+      ...(tokenUsage ? { tokenUsage } : {}),
+      ...(typeof usdCost === "number" ? { usdCost } : {}),
+      costAvailable: typeof usdCost === "number"
+    };
+  }, [
+    selectedSession,
+    selectedSessionKey,
+    modelBySession,
+    tokenUsageBySession,
+    costUsdBySession
+  ]);
 
   return (
     <div className={`app-shell ${resizingSidebar ? "app-shell--resizing" : ""}`} ref={shellRef}>
@@ -174,7 +229,7 @@ export default function App() {
           </p>
         ) : null}
 
-        <ChatPanel session={selectedSession} messages={messages} />
+        <ChatPanel session={selectedSession} messages={messages} costDisplay={costDisplay} />
         <Composer
           sessionKey={selectedSessionKey}
           disabled={loading || selectedSessionKey === null}
