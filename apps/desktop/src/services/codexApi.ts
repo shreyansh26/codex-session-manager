@@ -9,9 +9,14 @@ import type {
   DeviceRecord,
   RpcNotification,
   SessionSummary,
-  ThreadPayload
+  ThreadPayload,
+  ThreadTokenUsage
 } from "../domain/types";
-import { extractImageAttachments, extractItemMessagePayload } from "./eventParser";
+import {
+  extractImageAttachments,
+  extractItemMessagePayload,
+  parseThreadTokenUsageNotification
+} from "./eventParser";
 import { JsonRpcClient } from "./jsonRpcClient";
 
 type ClientState = {
@@ -20,6 +25,13 @@ type ClientState = {
   initialized: boolean;
   unsubscribe: (() => void) | null;
 };
+
+export interface ThreadUsageSnapshot {
+  threadId: string;
+  turnId?: string;
+  tokenUsage: ThreadTokenUsage;
+  model?: string;
+}
 
 const clients = new Map<string, ClientState>();
 
@@ -302,6 +314,89 @@ export const listDirectories = async (
   return {
     cwd: normalizedCwd,
     entries: parseLsDirectoryEntries(stdout, normalizedCwd)
+  };
+};
+
+export const readThreadUsageFromRollout = async (
+  device: DeviceRecord,
+  threadId: string
+): Promise<ThreadUsageSnapshot | null> => {
+  // Thread ids are generated UUID-like identifiers. Skip fallback for unexpected input.
+  if (!/^[A-Za-z0-9-]+$/.test(threadId)) {
+    return null;
+  }
+
+  const client = await ensureInitialized(device);
+  const result = await client.call<unknown>("command/exec", {
+    command: [
+      "sh",
+      "-lc",
+      [
+        'root="${HOME}/.codex/sessions"',
+        '[ -d "$root" ] || exit 0',
+        `match="$(find "$root" -type f -name '*${threadId}.jsonl' 2>/dev/null | LC_ALL=C sort | tail -n 1)"`,
+        '[ -n "$match" ] || exit 0',
+        'line="$(grep -F \'"type":"token_count"\' "$match" | tail -n 1 || true)"',
+        'printf "%s" "$line"'
+      ].join("; ")
+    ],
+    cwd: "."
+  });
+
+  const response = asRecord(result);
+  const exitCodeRaw = response?.exitCode ?? response?.exit_code;
+  const exitCode =
+    typeof exitCodeRaw === "number"
+      ? exitCodeRaw
+      : typeof exitCodeRaw === "string"
+        ? Number.parseInt(exitCodeRaw, 10)
+        : 0;
+  if (!Number.isFinite(exitCode) || exitCode !== 0) {
+    return null;
+  }
+
+  const stdout = typeof response?.stdout === "string" ? response.stdout.trim() : "";
+  if (stdout.length === 0) {
+    return null;
+  }
+
+  const lastLine = stdout.split(/\r?\n/).at(-1)?.trim() ?? "";
+  if (lastLine.length === 0) {
+    return null;
+  }
+
+  let parsedLine: unknown;
+  try {
+    parsedLine = JSON.parse(lastLine);
+  } catch {
+    return null;
+  }
+
+  const parsedRecord = asRecord(parsedLine);
+  const payload = asRecord(parsedRecord?.payload) ?? parsedRecord;
+  if (!payload) {
+    return null;
+  }
+
+  const usageEvent = parseThreadTokenUsageNotification({
+    method: "rollout/token_count",
+    params: {
+      threadId,
+      msg: payload
+    }
+  });
+  if (!usageEvent) {
+    return null;
+  }
+
+  const limitName = pickString(asRecord(payload.rate_limits), ["limit_name", "limitName"]);
+  const normalizedModel = normalizeModelFromLimitName(limitName);
+
+  return {
+    threadId: usageEvent.threadId,
+    ...(usageEvent.turnId ? { turnId: usageEvent.turnId } : {}),
+    tokenUsage: usageEvent.tokenUsage,
+    ...(normalizedModel ? { model: normalizedModel } : {})
   };
 };
 
@@ -975,6 +1070,14 @@ const pickThreadModel = (
   }
 
   return null;
+};
+
+const normalizeModelFromLimitName = (value: string | null): string | null => {
+  if (!value) {
+    return null;
+  }
+  const normalized = value.trim().toLowerCase().replace(/\s+/g, "-");
+  return normalized.length > 0 ? normalized : null;
 };
 
 const truncateForPreview = (value: string): string => {

@@ -9,6 +9,8 @@ interface ChatPanelProps {
   costDisplay: SessionCostDisplay;
 }
 
+const numberFormatter = new Intl.NumberFormat("en-US");
+
 const formatFullTimestamp = (timestamp: string): string => {
   const date = new Date(timestamp);
   if (Number.isNaN(date.getTime())) {
@@ -32,7 +34,7 @@ const formatTokenUsage = (costDisplay: SessionCostDisplay): string => {
   }
 
   const usage = costDisplay.tokenUsage.total;
-  return `Tokens: ${usage.totalTokens.toLocaleString()} (in ${usage.inputTokens.toLocaleString()}, cached ${usage.cachedInputTokens.toLocaleString()}, out ${usage.outputTokens.toLocaleString()})`;
+  return `Tokens: ${numberFormatter.format(usage.totalTokens)} (in ${numberFormatter.format(usage.inputTokens)}, cached ${numberFormatter.format(usage.cachedInputTokens)}, out ${numberFormatter.format(usage.outputTokens)})`;
 };
 
 const formatUsdCost = (value: number): string => {

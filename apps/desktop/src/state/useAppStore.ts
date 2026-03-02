@@ -17,6 +17,7 @@ import {
   closeDeviceClient,
   listDirectories,
   listThreads,
+  readThreadUsageFromRollout,
   readAccount,
   readThread,
   resumeThread,
@@ -79,6 +80,7 @@ const STREAMING_MERGE_WINDOW_MS = 10_000;
 const POST_SEND_REFRESH_BURST_MS = 45_000;
 const POST_SEND_REFRESH_INTERVAL_MS = 1_200;
 const POST_SEND_REFRESH_INITIAL_DELAYS_MS = [250, 700, 1_300];
+const USAGE_BACKFILL_MIN_INTERVAL_MS = 5_000;
 const PENDING_OPTIMISTIC_RETAIN_MS = 120_000;
 const OPTIMISTIC_ACK_CLOCK_SKEW_MS = 8_000;
 const OPTIMISTIC_ACK_MAX_DELAY_MS = 45_000;
@@ -549,10 +551,21 @@ const accumulateSessionCostFromLast = (params: {
     };
   }
 
+  const totalCostUsd = computeCostUsdFromUsage(params.tokenUsage.total, pricing);
+  const withTotalBaseline = (value: number | null): number | null => {
+    if (totalCostUsd === null) {
+      return value;
+    }
+    if (value === null) {
+      return totalCostUsd;
+    }
+    return totalCostUsd > value ? totalCostUsd : value;
+  };
+
   const usageEventKey = makeUsageDeltaEventKey(params.tokenUsage.turnId, params.tokenUsage.last);
   if (usageEventKey === params.lastAppliedEventKey) {
     return {
-      nextCostUsd: currentCostUsd,
+      nextCostUsd: withTotalBaseline(currentCostUsd),
       nextAppliedEventKey: params.lastAppliedEventKey
     };
   }
@@ -560,13 +573,13 @@ const accumulateSessionCostFromLast = (params: {
   const lastCostUsd = computeCostUsdFromUsage(params.tokenUsage.last, pricing);
   if (lastCostUsd === null) {
     return {
-      nextCostUsd: currentCostUsd,
+      nextCostUsd: withTotalBaseline(currentCostUsd),
       nextAppliedEventKey: params.lastAppliedEventKey
     };
   }
 
   return {
-    nextCostUsd: (currentCostUsd ?? 0) + lastCostUsd,
+    nextCostUsd: withTotalBaseline((currentCostUsd ?? 0) + lastCostUsd),
     nextAppliedEventKey: usageEventKey
   };
 };
@@ -624,6 +637,7 @@ export const useAppStore = create<AppStore>((set, get) => {
   const notificationRefreshAtMs = new Map<string, number>();
   const postSendRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const lastAppliedCostEventKeyBySession = new Map<string, string>();
+  const usageBackfillAtMsBySession = new Map<string, number>();
 
   const stopPostSendRefresh = (sessionKey: string): void => {
     const pendingTimer = postSendRefreshTimers.get(sessionKey);
@@ -647,6 +661,15 @@ export const useAppStore = create<AppStore>((set, get) => {
     for (const sessionKey of lastAppliedCostEventKeyBySession.keys()) {
       if (sessionKey.startsWith(prefix)) {
         lastAppliedCostEventKeyBySession.delete(sessionKey);
+      }
+    }
+  };
+
+  const clearUsageBackfillStateForDevice = (deviceId: string): void => {
+    const prefix = `${deviceId}::`;
+    for (const sessionKey of usageBackfillAtMsBySession.keys()) {
+      if (sessionKey.startsWith(prefix)) {
+        usageBackfillAtMsBySession.delete(sessionKey);
       }
     }
   };
@@ -683,6 +706,89 @@ export const useAppStore = create<AppStore>((set, get) => {
 
     const pendingTimer = setTimeout(tick, POST_SEND_REFRESH_INTERVAL_MS);
     postSendRefreshTimers.set(params.sessionKey, pendingTimer);
+  };
+
+  const backfillUsageFromRollout = (params: {
+    sessionKey: string;
+    deviceId: string;
+    threadId: string;
+  }): void => {
+    const nowMs = Date.now();
+    const lastBackfillMs = usageBackfillAtMsBySession.get(params.sessionKey) ?? 0;
+    if (nowMs - lastBackfillMs < USAGE_BACKFILL_MIN_INTERVAL_MS) {
+      return;
+    }
+    usageBackfillAtMsBySession.set(params.sessionKey, nowMs);
+
+    void (async () => {
+      const snapshot = get();
+      const existingUsage = snapshot.tokenUsageBySession[params.sessionKey];
+      if (existingUsage && existingUsage.threadId === params.threadId) {
+        return;
+      }
+
+      const device = snapshot.devices.find((entry) => entry.id === params.deviceId);
+      if (!device || !device.connected) {
+        return;
+      }
+
+      try {
+        const usageSnapshot = await readThreadUsageFromRollout(device, params.threadId);
+        if (!usageSnapshot) {
+          return;
+        }
+
+        set((state) => {
+          const sessionKey = resolveSessionKeyForThread(
+            state.sessions,
+            params.deviceId,
+            params.threadId
+          );
+          const tokenUsageState: ThreadTokenUsageState = {
+            threadId: usageSnapshot.threadId,
+            ...(usageSnapshot.turnId ? { turnId: usageSnapshot.turnId } : {}),
+            total: usageSnapshot.tokenUsage.total,
+            last: usageSnapshot.tokenUsage.last,
+            modelContextWindow: usageSnapshot.tokenUsage.modelContextWindow ?? null,
+            updatedAt: new Date().toISOString()
+          };
+
+          const nextModelBySession = usageSnapshot.model
+            ? {
+                ...state.modelBySession,
+                [sessionKey]: usageSnapshot.model
+              }
+            : state.modelBySession;
+          const model = usageSnapshot.model ?? state.modelBySession[sessionKey];
+          const accumulation = accumulateSessionCostFromLast({
+            currentCostUsd: state.costUsdBySession[sessionKey],
+            model,
+            tokenUsage: tokenUsageState,
+            lastAppliedEventKey: lastAppliedCostEventKeyBySession.get(sessionKey)
+          });
+          if (accumulation.nextAppliedEventKey) {
+            lastAppliedCostEventKeyBySession.set(
+              sessionKey,
+              accumulation.nextAppliedEventKey
+            );
+          }
+
+          return {
+            modelBySession: nextModelBySession,
+            tokenUsageBySession: {
+              ...state.tokenUsageBySession,
+              [sessionKey]: tokenUsageState
+            },
+            costUsdBySession: {
+              ...state.costUsdBySession,
+              [sessionKey]: accumulation.nextCostUsd
+            }
+          };
+        });
+      } catch {
+        // Best-effort fallback; ignore rollout read failures.
+      }
+    })();
   };
 
   const refreshThreadFromNotification = (
@@ -1105,8 +1211,14 @@ export const useAppStore = create<AppStore>((set, get) => {
                     state.messagesBySession[payload.session.key] ?? [],
                     payload.messages
                   )
-                }
+            }
           };
+        });
+
+        backfillUsageFromRollout({
+          sessionKey: payload.session.key,
+          deviceId,
+          threadId
         });
       } catch (error) {
         set({ globalError: toErrorMessage(error) });
@@ -1289,6 +1401,7 @@ export const useAppStore = create<AppStore>((set, get) => {
 
         stopPostSendRefreshesForDevice(deviceId);
         clearAppliedCostEventKeysForDevice(deviceId);
+        clearUsageBackfillStateForDevice(deviceId);
         const disconnected = await disconnectDevice(deviceId);
         closeDeviceClient(deviceId);
         set((state) => ({
@@ -1307,6 +1420,7 @@ export const useAppStore = create<AppStore>((set, get) => {
 
         stopPostSendRefreshesForDevice(deviceId);
         clearAppliedCostEventKeysForDevice(deviceId);
+        clearUsageBackfillStateForDevice(deviceId);
         const devices = await removeDevice(deviceId);
         closeDeviceClient(deviceId);
         set((state) => {

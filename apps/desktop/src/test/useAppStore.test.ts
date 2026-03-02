@@ -196,7 +196,8 @@ describe("useAppStore cost helpers", () => {
       lastAppliedEventKey: undefined
     });
 
-    expect(first.nextCostUsd).toBeCloseTo(0.00119375, 9);
+    // First application should not undercount: anchor to total usage snapshot.
+    expect(first.nextCostUsd).toBeCloseTo(0.006025, 9);
     expect(first.nextAppliedEventKey).toBe(
       __TEST_ONLY__.makeUsageDeltaEventKey(usage.turnId, usage.last)
     );
