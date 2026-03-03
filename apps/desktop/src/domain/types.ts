@@ -163,3 +163,52 @@ export interface ThreadIdentifier {
   deviceId: string;
   threadId: string;
 }
+
+export interface SearchIndexMessagePayload {
+  id: string;
+  role: ChatRole;
+  content: string;
+  createdAt: string;
+}
+
+export interface SearchIndexThreadPayload {
+  sessionKey: string;
+  threadId: string;
+  deviceId: string;
+  sessionTitle: string;
+  deviceLabel: string;
+  deviceAddress: string;
+  updatedAt: string;
+  messages: SearchIndexMessagePayload[];
+}
+
+export interface SearchQueryRequest {
+  query: string;
+  deviceId?: string;
+  threshold?: number;
+  maxSessions?: number;
+}
+
+export interface SearchSessionHit {
+  sessionKey: string;
+  threadId: string;
+  deviceId: string;
+  sessionTitle: string;
+  deviceLabel: string;
+  deviceAddress: string;
+  updatedAt: string;
+  maxScore: number;
+  hitCount: number;
+}
+
+export interface SearchQueryResponse {
+  query: string;
+  totalHits: number;
+  sessionHits: SearchSessionHit[];
+}
+
+export interface SearchBootstrapStatus {
+  indexedSessions: number;
+  indexedMessages: number;
+  lastUpdatedAtMs?: number;
+}

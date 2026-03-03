@@ -14,6 +14,8 @@ import type {
   DeviceRecord,
   NewSessionRequest,
   RpcNotification,
+  SearchIndexThreadPayload,
+  SearchSessionHit,
   SessionSummary,
   ThinkingEffort,
   TokenUsageBreakdown,
@@ -45,7 +47,11 @@ import {
   connectDevice,
   disconnectDevice,
   listDevices,
-  removeDevice
+  removeDevice,
+  searchBootstrapStatus,
+  searchIndexRemoveDevice,
+  searchIndexUpsertThread,
+  searchQuery
 } from "../services/tauriBridge";
 import { mergeSessions } from "./sessionMerge";
 
@@ -60,6 +66,13 @@ interface AppStore {
   costUsdBySession: Record<string, number | null>;
   availableModelsByDevice: Record<string, string[]>;
   composerPrefsBySession: Record<string, ComposerPreference>;
+  searchResults: SearchSessionHit[];
+  searchTotalHits: number;
+  searchLoading: boolean;
+  searchHydrating: boolean;
+  searchHydratedCount: number;
+  searchHydrationTotal: number;
+  searchError: string | null;
   globalError: string | null;
   initializing: boolean;
   initialize: () => Promise<void>;
@@ -83,6 +96,8 @@ interface AppStore {
   connect: (deviceId: string) => Promise<void>;
   disconnect: (deviceId: string) => Promise<void>;
   remove: (deviceId: string) => Promise<void>;
+  runChatSearch: (query: string, deviceId: string | null) => Promise<void>;
+  clearChatSearch: () => void;
   clearError: () => void;
 }
 
@@ -97,6 +112,9 @@ const PENDING_OPTIMISTIC_RETAIN_MS = 120_000;
 const OPTIMISTIC_ACK_CLOCK_SKEW_MS = 8_000;
 const OPTIMISTIC_ACK_MAX_DELAY_MS = 45_000;
 const SERVER_DUPLICATE_WINDOW_MS = 120_000;
+const SEARCH_SIMILARITY_THRESHOLD = 0.9;
+const SEARCH_MAX_SESSIONS = 10;
+const BACKGROUND_SEARCH_HYDRATION_DELAY_MS = 80;
 
 const pickSelectedSession = (
   preferred: string | null,
@@ -500,6 +518,25 @@ const normalizeSubmissionImages = (
       url: image.url.trim()
     }));
 
+const toSearchIndexThreadPayload = (
+  session: SessionSummary,
+  messages: ChatMessage[]
+): SearchIndexThreadPayload => ({
+  sessionKey: session.key,
+  threadId: session.threadId,
+  deviceId: session.deviceId,
+  sessionTitle: session.title,
+  deviceLabel: session.deviceLabel,
+  deviceAddress: session.deviceAddress,
+  updatedAt: session.updatedAt,
+  messages: messages.map((message) => ({
+    id: message.id,
+    role: message.role,
+    content: message.content,
+    createdAt: message.createdAt
+  }))
+});
+
 const toComposerPreference = (params: {
   model: string | undefined;
   effort: ThinkingEffort | undefined;
@@ -686,6 +723,12 @@ export const useAppStore = create<AppStore>((set, get) => {
   const postSendRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const lastAppliedCostEventKeyBySession = new Map<string, string>();
   const usageBackfillAtMsBySession = new Map<string, number>();
+  const hydratedSearchSessions = new Set<string>();
+  const queuedSearchHydrationSessions = new Set<string>();
+  let searchHydrationPromise: Promise<void> | null = null;
+  let activeHydrationSessionKey: string | null = null;
+  let completedHydrations = 0;
+  let activeSearchRequestId = 0;
 
   const stopPostSendRefresh = (sessionKey: string): void => {
     const pendingTimer = postSendRefreshTimers.get(sessionKey);
@@ -718,6 +761,24 @@ export const useAppStore = create<AppStore>((set, get) => {
     for (const sessionKey of usageBackfillAtMsBySession.keys()) {
       if (sessionKey.startsWith(prefix)) {
         usageBackfillAtMsBySession.delete(sessionKey);
+      }
+    }
+  };
+
+  const clearHydratedSearchSessionsForDevice = (deviceId: string): void => {
+    const prefix = `${deviceId}::`;
+    for (const sessionKey of [...hydratedSearchSessions]) {
+      if (sessionKey.startsWith(prefix)) {
+        hydratedSearchSessions.delete(sessionKey);
+      }
+    }
+  };
+
+  const clearQueuedSearchHydrationForDevice = (deviceId: string): void => {
+    const prefix = `${deviceId}::`;
+    for (const sessionKey of [...queuedSearchHydrationSessions]) {
+      if (sessionKey.startsWith(prefix)) {
+        queuedSearchHydrationSessions.delete(sessionKey);
       }
     }
   };
@@ -780,6 +841,107 @@ export const useAppStore = create<AppStore>((set, get) => {
         composerPrefsBySession: nextComposerPrefs
       };
     });
+  };
+
+  const upsertThreadIntoSearchIndex = (
+    session: SessionSummary,
+    messages: ChatMessage[]
+  ): void => {
+    hydratedSearchSessions.add(session.key);
+    const payload = toSearchIndexThreadPayload(session, messages);
+    void searchIndexUpsertThread(payload).catch(() => {
+      // Keep search functional even if persistence/indexing fails on one update.
+    });
+  };
+
+  const syncSearchHydrationProgress = (): void => {
+    const pendingCount =
+      queuedSearchHydrationSessions.size + (activeHydrationSessionKey ? 1 : 0);
+    const total = completedHydrations + pendingCount;
+    set({
+      searchHydrating: pendingCount > 0,
+      searchHydratedCount: completedHydrations,
+      searchHydrationTotal: total
+    });
+  };
+
+  const startBackgroundSearchHydration = (): void => {
+    if (searchHydrationPromise || queuedSearchHydrationSessions.size === 0) {
+      return;
+    }
+
+    completedHydrations = 0;
+    syncSearchHydrationProgress();
+
+    searchHydrationPromise = (async () => {
+      while (queuedSearchHydrationSessions.size > 0) {
+        const nextSessionKey = queuedSearchHydrationSessions.values().next()
+          .value as string | undefined;
+        if (!nextSessionKey) {
+          break;
+        }
+
+        queuedSearchHydrationSessions.delete(nextSessionKey);
+        activeHydrationSessionKey = nextSessionKey;
+        syncSearchHydrationProgress();
+
+        const session = get().sessions.find((entry) => entry.key === nextSessionKey);
+        if (session && !hydratedSearchSessions.has(session.key)) {
+          await get().refreshThread(session.deviceId, session.threadId, {
+            preserveSummary: true
+          });
+        }
+
+        completedHydrations += 1;
+        activeHydrationSessionKey = null;
+        syncSearchHydrationProgress();
+
+        await new Promise<void>((resolve) => {
+          window.setTimeout(resolve, BACKGROUND_SEARCH_HYDRATION_DELAY_MS);
+        });
+      }
+    })()
+      .catch(() => {
+        // Search hydration is best-effort; refreshThread already records user-visible errors.
+      })
+      .finally(() => {
+        activeHydrationSessionKey = null;
+        searchHydrationPromise = null;
+        completedHydrations = 0;
+        set({
+          searchHydrating: false,
+          searchHydratedCount: 0,
+          searchHydrationTotal: 0
+        });
+
+        if (queuedSearchHydrationSessions.size > 0) {
+          startBackgroundSearchHydration();
+        }
+      });
+  };
+
+  const scheduleBackgroundSearchHydration = (sessions: SessionSummary[]): void => {
+    let added = false;
+    for (const session of sessions) {
+      if (hydratedSearchSessions.has(session.key)) {
+        continue;
+      }
+      if (queuedSearchHydrationSessions.has(session.key)) {
+        continue;
+      }
+      if (session.threadId.trim().length === 0) {
+        continue;
+      }
+      queuedSearchHydrationSessions.add(session.key);
+      added = true;
+    }
+
+    if (!added && !searchHydrationPromise) {
+      return;
+    }
+
+    syncSearchHydrationProgress();
+    startBackgroundSearchHydration();
   };
 
   const startPostSendRefreshBurst = (params: {
@@ -1077,6 +1239,13 @@ export const useAppStore = create<AppStore>((set, get) => {
     costUsdBySession: {},
     availableModelsByDevice: {},
     composerPrefsBySession: {},
+    searchResults: [],
+    searchTotalHits: 0,
+    searchLoading: false,
+    searchHydrating: false,
+    searchHydratedCount: 0,
+    searchHydrationTotal: 0,
+    searchError: null,
     globalError: null,
     initialize: async () => {
       if (get().initializing) {
@@ -1087,6 +1256,22 @@ export const useAppStore = create<AppStore>((set, get) => {
       setNotificationSink(applyNotification);
 
       try {
+        try {
+          const status = await searchBootstrapStatus();
+          if (
+            status.indexedSessions > 0 ||
+            status.indexedMessages > 0
+          ) {
+            // Persisted index exists; new/updated threads will be upserted as they load.
+            set({
+              searchHydratedCount: status.indexedSessions,
+              searchHydrationTotal: status.indexedSessions
+            });
+          }
+        } catch {
+          // Search bootstrap status is optional; ignore failures.
+        }
+
         let devices = await listDevices();
 
         const localDevices = devices.filter(
@@ -1139,6 +1324,7 @@ export const useAppStore = create<AppStore>((set, get) => {
         }
 
         await get().refreshSessions();
+        scheduleBackgroundSearchHydration(get().sessions);
       } catch (error) {
         set({ globalError: toErrorMessage(error) });
       } finally {
@@ -1224,6 +1410,8 @@ export const useAppStore = create<AppStore>((set, get) => {
           skipMessages: true
         });
       }
+
+      scheduleBackgroundSearchHydration(get().sessions);
     },
     refreshDeviceSessions: async (deviceId) => {
       const device = get().devices.find((entry) => entry.id === deviceId);
@@ -1280,6 +1468,10 @@ export const useAppStore = create<AppStore>((set, get) => {
             skipMessages: true
           });
         }
+
+        scheduleBackgroundSearchHydration(
+          get().sessions.filter((session) => session.deviceId === deviceId)
+        );
       } catch (error) {
         const message = toErrorMessage(error);
         set((state) => ({
@@ -1339,6 +1531,12 @@ export const useAppStore = create<AppStore>((set, get) => {
           deviceId,
           threadId
         });
+
+        if (!options?.skipMessages) {
+          const indexedMessages =
+            get().messagesBySession[payload.session.key] ?? payload.messages;
+          upsertThreadIntoSearchIndex(payload.session, indexedMessages);
+        }
       } catch (error) {
         set({ globalError: toErrorMessage(error) });
       }
@@ -1394,6 +1592,10 @@ export const useAppStore = create<AppStore>((set, get) => {
         ),
         globalError: null
       }));
+
+      const indexedMessages =
+        get().messagesBySession[payload.session.key] ?? payload.messages;
+      upsertThreadIntoSearchIndex(payload.session, indexedMessages);
 
       return payload.session.key;
     },
@@ -1562,6 +1764,9 @@ export const useAppStore = create<AppStore>((set, get) => {
         }));
         refreshAvailableModelsForDevice(deviceId);
         await get().refreshDeviceSessions(deviceId);
+        scheduleBackgroundSearchHydration(
+          get().sessions.filter((session) => session.deviceId === deviceId)
+        );
       } catch (error) {
         set({ globalError: toErrorMessage(error) });
       } finally {
@@ -1578,6 +1783,9 @@ export const useAppStore = create<AppStore>((set, get) => {
         stopPostSendRefreshesForDevice(deviceId);
         clearAppliedCostEventKeysForDevice(deviceId);
         clearUsageBackfillStateForDevice(deviceId);
+        clearQueuedSearchHydrationForDevice(deviceId);
+        clearHydratedSearchSessionsForDevice(deviceId);
+        syncSearchHydrationProgress();
         const disconnected = await disconnectDevice(deviceId);
         closeDeviceClient(deviceId);
         set((state) => ({
@@ -1597,7 +1805,13 @@ export const useAppStore = create<AppStore>((set, get) => {
         stopPostSendRefreshesForDevice(deviceId);
         clearAppliedCostEventKeysForDevice(deviceId);
         clearUsageBackfillStateForDevice(deviceId);
+        clearQueuedSearchHydrationForDevice(deviceId);
         const devices = await removeDevice(deviceId);
+        clearHydratedSearchSessionsForDevice(deviceId);
+        syncSearchHydrationProgress();
+        void searchIndexRemoveDevice(deviceId).catch(() => {
+          // Best-effort cleanup; search index can be rebuilt from thread hydration.
+        });
         closeDeviceClient(deviceId);
         set((state) => {
           const sessions = state.sessions.filter((session) => session.deviceId !== deviceId);
@@ -1631,6 +1845,13 @@ export const useAppStore = create<AppStore>((set, get) => {
               ([id]) => id !== deviceId
             )
           );
+          const searchResults = state.searchResults.filter(
+            (sessionHit) => sessionHit.deviceId !== deviceId
+          );
+          const searchTotalHits = searchResults.reduce(
+            (count, sessionHit) => count + sessionHit.hitCount,
+            0
+          );
 
           return {
             devices,
@@ -1641,12 +1862,99 @@ export const useAppStore = create<AppStore>((set, get) => {
             costUsdBySession,
             composerPrefsBySession,
             availableModelsByDevice,
+            searchResults,
+            searchTotalHits,
             selectedSessionKey: pickSelectedSession(state.selectedSessionKey, sessions)
           };
         });
       } catch (error) {
         set({ globalError: toErrorMessage(error) });
       }
+    },
+    runChatSearch: async (query, deviceId) => {
+      const trimmedQuery = query.trim();
+      if (trimmedQuery.length === 0) {
+        set({
+          searchResults: [],
+          searchTotalHits: 0,
+          searchLoading: false,
+          searchError: null
+        });
+        return;
+      }
+
+      scheduleBackgroundSearchHydration(get().sessions);
+
+      const requestId = activeSearchRequestId + 1;
+      activeSearchRequestId = requestId;
+      set({
+        searchLoading: true,
+        searchError: null
+      });
+
+      const request = {
+        query: trimmedQuery,
+        ...(deviceId ? { deviceId } : {}),
+        threshold: SEARCH_SIMILARITY_THRESHOLD,
+        maxSessions: SEARCH_MAX_SESSIONS
+      };
+
+      try {
+        const immediate = await searchQuery(request);
+        if (requestId !== activeSearchRequestId) {
+          return;
+        }
+        set({
+          searchResults: immediate.sessionHits,
+          searchTotalHits: immediate.totalHits,
+          searchLoading: false,
+          searchError: null
+        });
+      } catch (error) {
+        if (requestId !== activeSearchRequestId) {
+          return;
+        }
+        set({
+          searchLoading: false,
+          searchError: toErrorMessage(error)
+        });
+        return;
+      }
+
+      void (async () => {
+        const hydrationPromise = searchHydrationPromise;
+        if (!hydrationPromise) {
+          return;
+        }
+        await hydrationPromise;
+        if (requestId !== activeSearchRequestId) {
+          return;
+        }
+
+        try {
+          const hydrated = await searchQuery(request);
+          if (requestId !== activeSearchRequestId) {
+            return;
+          }
+
+          set({
+            searchResults: hydrated.sessionHits,
+            searchTotalHits: hydrated.totalHits,
+            searchError: null
+          });
+        } catch {
+          // Keep immediate search results if hydration rerun fails.
+        }
+      })();
+    },
+    clearChatSearch: () => {
+      activeSearchRequestId += 1;
+      set({
+        searchResults: [],
+        searchTotalHits: 0,
+        searchLoading: false,
+        searchError: null
+      });
     },
     clearError: () => {
       set({ globalError: null });
