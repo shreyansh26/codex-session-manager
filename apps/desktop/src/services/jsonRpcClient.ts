@@ -217,5 +217,5 @@ const isObject = (value: unknown): value is Record<string, unknown> =>
 
 const sleep = (durationMs: number): Promise<void> =>
   new Promise((resolve) => {
-    window.setTimeout(resolve, durationMs);
+    globalThis.setTimeout(resolve, durationMs);
   });
