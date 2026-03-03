@@ -41,6 +41,7 @@ import {
   parseThreadTokenUsageNotification
 } from "../services/eventParser";
 import { computeCostUsdFromUsage, resolveModelPricing } from "../services/modelPricing";
+import { toSearchIndexThreadPayload } from "../services/searchIndexPayload";
 import {
   addLocalDevice,
   addSshDevice,
@@ -53,6 +54,10 @@ import {
   searchIndexUpsertThread,
   searchQuery
 } from "../services/tauriBridge";
+import type {
+  SearchHydrationWorkerRequest,
+  SearchHydrationWorkerResponse
+} from "../workers/searchHydrationProtocol";
 import { mergeSessions } from "./sessionMerge";
 
 interface AppStore {
@@ -114,7 +119,7 @@ const OPTIMISTIC_ACK_MAX_DELAY_MS = 45_000;
 const SERVER_DUPLICATE_WINDOW_MS = 120_000;
 const SEARCH_SIMILARITY_THRESHOLD = 0.9;
 const SEARCH_MAX_SESSIONS = 10;
-const BACKGROUND_SEARCH_HYDRATION_DELAY_MS = 80;
+const BACKGROUND_SEARCH_HYDRATION_DELAY_MS = 30;
 
 const pickSelectedSession = (
   preferred: string | null,
@@ -518,25 +523,6 @@ const normalizeSubmissionImages = (
       url: image.url.trim()
     }));
 
-const toSearchIndexThreadPayload = (
-  session: SessionSummary,
-  messages: ChatMessage[]
-): SearchIndexThreadPayload => ({
-  sessionKey: session.key,
-  threadId: session.threadId,
-  deviceId: session.deviceId,
-  sessionTitle: session.title,
-  deviceLabel: session.deviceLabel,
-  deviceAddress: session.deviceAddress,
-  updatedAt: session.updatedAt,
-  messages: messages.map((message) => ({
-    id: message.id,
-    role: message.role,
-    content: message.content,
-    createdAt: message.createdAt
-  }))
-});
-
 const toComposerPreference = (params: {
   model: string | undefined;
   effort: ThinkingEffort | undefined;
@@ -718,6 +704,8 @@ const pickString = (
   return null;
 };
 
+let shutdownSearchHydrationWorkerCallback: (() => void) | null = null;
+
 export const useAppStore = create<AppStore>((set, get) => {
   const notificationRefreshAtMs = new Map<string, number>();
   const postSendRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -729,6 +717,172 @@ export const useAppStore = create<AppStore>((set, get) => {
   let activeHydrationSessionKey: string | null = null;
   let completedHydrations = 0;
   let activeSearchRequestId = 0;
+  let searchHydrationWorker: Worker | null = null;
+  let searchHydrationWorkerUnavailable = false;
+  let nextSearchHydrationWorkerRequestId = 1;
+  const pendingSearchHydrationWorkerRequests = new Map<
+    number,
+    {
+      sessionKey: string;
+      resolve: (payload: SearchIndexThreadPayload) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+
+  const rejectPendingSearchHydrationWorkerRequests = (error: Error): void => {
+    for (const pending of pendingSearchHydrationWorkerRequests.values()) {
+      pending.reject(error);
+    }
+    pendingSearchHydrationWorkerRequests.clear();
+  };
+
+  const handleSearchHydrationWorkerResponse = (
+    response: SearchHydrationWorkerResponse
+  ): void => {
+    const pending = pendingSearchHydrationWorkerRequests.get(response.requestId);
+    if (!pending) {
+      return;
+    }
+    pendingSearchHydrationWorkerRequests.delete(response.requestId);
+
+    if (response.type === "hydrated-session") {
+      pending.resolve(response.payload);
+      return;
+    }
+
+    pending.reject(
+      new Error(
+        response.error || `Failed to hydrate search session ${response.sessionKey}.`
+      )
+    );
+  };
+
+  const ensureSearchHydrationWorker = (): Worker | null => {
+    if (searchHydrationWorkerUnavailable) {
+      return null;
+    }
+    if (searchHydrationWorker) {
+      return searchHydrationWorker;
+    }
+    if (typeof Worker !== "function") {
+      searchHydrationWorkerUnavailable = true;
+      return null;
+    }
+
+    try {
+      searchHydrationWorker = new Worker(
+        new URL("../workers/searchHydrationWorker.ts", import.meta.url),
+        { type: "module" }
+      );
+      searchHydrationWorker.onmessage = (
+        event: MessageEvent<SearchHydrationWorkerResponse>
+      ) => {
+        handleSearchHydrationWorkerResponse(event.data);
+      };
+      searchHydrationWorker.onerror = (event): void => {
+        const message =
+          event.message?.trim() || "Search hydration worker crashed unexpectedly.";
+        searchHydrationWorkerUnavailable = true;
+        rejectPendingSearchHydrationWorkerRequests(new Error(message));
+        searchHydrationWorker?.terminate();
+        searchHydrationWorker = null;
+      };
+      return searchHydrationWorker;
+    } catch {
+      searchHydrationWorkerUnavailable = true;
+      return null;
+    }
+  };
+
+  const requestHydrationFromWorker = async (
+    device: DeviceRecord,
+    session: SessionSummary
+  ): Promise<SearchIndexThreadPayload | null> => {
+    const worker = ensureSearchHydrationWorker();
+    if (!worker) {
+      return null;
+    }
+
+    const requestId = nextSearchHydrationWorkerRequestId;
+    nextSearchHydrationWorkerRequestId += 1;
+    const request: SearchHydrationWorkerRequest = {
+      type: "hydrate-session",
+      requestId,
+      device,
+      session
+    };
+
+    return new Promise<SearchIndexThreadPayload>((resolve, reject) => {
+      pendingSearchHydrationWorkerRequests.set(requestId, {
+        sessionKey: session.key,
+        resolve,
+        reject
+      });
+      try {
+        worker.postMessage(request);
+      } catch (error) {
+        pendingSearchHydrationWorkerRequests.delete(requestId);
+        reject(
+          error instanceof Error
+            ? error
+            : new Error("Failed to post search hydration request to worker.")
+        );
+      }
+    });
+  };
+
+  const closeSearchHydrationWorkerDevice = (deviceId: string): void => {
+    if (!searchHydrationWorker) {
+      return;
+    }
+    const request: SearchHydrationWorkerRequest = {
+      type: "close-device",
+      deviceId
+    };
+    try {
+      searchHydrationWorker.postMessage(request);
+    } catch {
+      // Non-critical cleanup.
+    }
+  };
+
+  const shutdownSearchHydrationWorker = (): void => {
+    if (!searchHydrationWorker) {
+      return;
+    }
+    try {
+      const request: SearchHydrationWorkerRequest = { type: "shutdown" };
+      searchHydrationWorker.postMessage(request);
+    } catch {
+      // Ignore shutdown message failures and terminate directly.
+    }
+    rejectPendingSearchHydrationWorkerRequests(
+      new Error("Search hydration worker was shut down.")
+    );
+    searchHydrationWorker.terminate();
+    searchHydrationWorker = null;
+  };
+
+  const hydrateSessionOnMainThread = async (
+    device: DeviceRecord,
+    session: SessionSummary
+  ): Promise<SearchIndexThreadPayload> => {
+    const payload = await readThread(device, session.threadId);
+    return toSearchIndexThreadPayload(payload.session, payload.messages);
+  };
+
+  const hydrateSessionSearchPayload = async (
+    device: DeviceRecord,
+    session: SessionSummary
+  ): Promise<SearchIndexThreadPayload> => {
+    const workerPayload = await requestHydrationFromWorker(device, session);
+    if (workerPayload) {
+      return workerPayload;
+    }
+    return hydrateSessionOnMainThread(device, session);
+  };
+
+  shutdownSearchHydrationWorkerCallback = shutdownSearchHydrationWorker;
 
   const stopPostSendRefresh = (sessionKey: string): void => {
     const pendingTimer = postSendRefreshTimers.get(sessionKey);
@@ -780,6 +934,19 @@ export const useAppStore = create<AppStore>((set, get) => {
       if (sessionKey.startsWith(prefix)) {
         queuedSearchHydrationSessions.delete(sessionKey);
       }
+    }
+  };
+
+  const rejectPendingSearchHydrationWorkerRequestsForDevice = (
+    deviceId: string
+  ): void => {
+    const prefix = `${deviceId}::`;
+    for (const [requestId, pending] of pendingSearchHydrationWorkerRequests) {
+      if (!pending.sessionKey.startsWith(prefix)) {
+        continue;
+      }
+      pendingSearchHydrationWorkerRequests.delete(requestId);
+      pending.reject(new Error(`Device ${deviceId} disconnected during search hydration.`));
     }
   };
 
@@ -886,10 +1053,28 @@ export const useAppStore = create<AppStore>((set, get) => {
         syncSearchHydrationProgress();
 
         const session = get().sessions.find((entry) => entry.key === nextSessionKey);
-        if (session && !hydratedSearchSessions.has(session.key)) {
-          await get().refreshThread(session.deviceId, session.threadId, {
-            preserveSummary: true
-          });
+        if (
+          session &&
+          !hydratedSearchSessions.has(session.key) &&
+          session.threadId.trim().length > 0
+        ) {
+          const device = get().devices.find(
+            (entry) => entry.id === session.deviceId && entry.connected
+          );
+          if (device) {
+            try {
+              const payload = await hydrateSessionSearchPayload(device, session);
+              const stillConnected = get().devices.some(
+                (entry) => entry.id === session.deviceId && entry.connected
+              );
+              if (stillConnected) {
+                await searchIndexUpsertThread(payload);
+                hydratedSearchSessions.add(session.key);
+              }
+            } catch {
+              // Search hydration is best-effort; keep queue progressing on failures.
+            }
+          }
         }
 
         completedHydrations += 1;
@@ -897,7 +1082,7 @@ export const useAppStore = create<AppStore>((set, get) => {
         syncSearchHydrationProgress();
 
         await new Promise<void>((resolve) => {
-          window.setTimeout(resolve, BACKGROUND_SEARCH_HYDRATION_DELAY_MS);
+          setTimeout(resolve, BACKGROUND_SEARCH_HYDRATION_DELAY_MS);
         });
       }
     })()
@@ -1785,6 +1970,8 @@ export const useAppStore = create<AppStore>((set, get) => {
         clearUsageBackfillStateForDevice(deviceId);
         clearQueuedSearchHydrationForDevice(deviceId);
         clearHydratedSearchSessionsForDevice(deviceId);
+        rejectPendingSearchHydrationWorkerRequestsForDevice(deviceId);
+        closeSearchHydrationWorkerDevice(deviceId);
         syncSearchHydrationProgress();
         const disconnected = await disconnectDevice(deviceId);
         closeDeviceClient(deviceId);
@@ -1806,6 +1993,8 @@ export const useAppStore = create<AppStore>((set, get) => {
         clearAppliedCostEventKeysForDevice(deviceId);
         clearUsageBackfillStateForDevice(deviceId);
         clearQueuedSearchHydrationForDevice(deviceId);
+        rejectPendingSearchHydrationWorkerRequestsForDevice(deviceId);
+        closeSearchHydrationWorkerDevice(deviceId);
         const devices = await removeDevice(deviceId);
         clearHydratedSearchSessionsForDevice(deviceId);
         syncSearchHydrationProgress();
@@ -1963,6 +2152,7 @@ export const useAppStore = create<AppStore>((set, get) => {
 });
 
 export const shutdownRpcClients = (): void => {
+  shutdownSearchHydrationWorkerCallback?.();
   setNotificationSink(null);
   closeAllClients();
 };
