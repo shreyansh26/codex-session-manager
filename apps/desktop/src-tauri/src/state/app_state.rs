@@ -17,10 +17,16 @@ use crate::state::models::{
     LocalDeviceConfig, PersistedDevices, SshDeviceConfig, DEFAULT_REMOTE_APP_SERVER_PORT,
     DEFAULT_SSH_PORT,
 };
+use crate::state::search_index::{
+    SearchBootstrapStatus, SearchIndex, SearchIndexStorageError, SearchIndexThreadPayload,
+    SearchQueryRequest, SearchQueryResponse,
+};
 
 pub struct AppState {
     inner: Mutex<InnerState>,
     storage_path: PathBuf,
+    search_index: Mutex<SearchIndex>,
+    search_index_path: PathBuf,
 }
 
 #[derive(Default)]
@@ -76,16 +82,37 @@ pub enum AppStateError {
         path: String,
         source: serde_json::Error,
     },
+    #[error("search index lock poisoned")]
+    SearchIndexPoisoned,
+    #[error("failed to persist search index at {path}: {source}")]
+    PersistSearchIndex { path: String, source: io::Error },
+    #[error("failed to parse search index at {path}: {source}")]
+    ParseSearchIndex {
+        path: String,
+        source: serde_json::Error,
+    },
 }
 
 impl Default for AppState {
     fn default() -> Self {
         let storage_path = device_storage_path();
+        let search_index_path = search_index_storage_path();
         let devices = match load_devices(&storage_path) {
             Ok(records) => records,
             Err(error) => {
                 warn!(error = %error, "failed to load persisted device metadata; using empty device list");
                 HashMap::new()
+            }
+        };
+        let search_index = match SearchIndex::load_from_path(&search_index_path) {
+            Ok(index) => index,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    path = %search_index_path.display(),
+                    "failed to load persisted search index; using empty index"
+                );
+                SearchIndex::default()
             }
         };
 
@@ -95,6 +122,8 @@ impl Default for AppState {
                 connections: HashMap::new(),
             }),
             storage_path,
+            search_index: Mutex::new(search_index),
+            search_index_path,
         }
     }
 }
@@ -193,6 +222,14 @@ impl AppState {
             self.persist_devices_locked(&inner)?;
         }
 
+        if let Err(error) = self.search_index_remove_device(device_id) {
+            warn!(
+                error = %error,
+                device_id,
+                "failed to clear removed device entries from search index"
+            );
+        }
+
         self.list_devices()
     }
 
@@ -270,6 +307,37 @@ impl AppState {
         Ok(response)
     }
 
+    pub fn search_index_upsert_thread(
+        &self,
+        payload: SearchIndexThreadPayload,
+    ) -> Result<(), AppStateError> {
+        let mut index = self.lock_search_index()?;
+        index.upsert_thread(payload);
+        self.persist_search_index_locked(&index)
+    }
+
+    pub fn search_index_remove_device(&self, device_id: &str) -> Result<(), AppStateError> {
+        let mut index = self.lock_search_index()?;
+        let removed = index.remove_device(device_id);
+        if removed == 0 {
+            return Ok(());
+        }
+        self.persist_search_index_locked(&index)
+    }
+
+    pub fn search_query(
+        &self,
+        request: SearchQueryRequest,
+    ) -> Result<SearchQueryResponse, AppStateError> {
+        let index = self.lock_search_index()?;
+        Ok(index.query(request))
+    }
+
+    pub fn search_bootstrap_status(&self) -> Result<SearchBootstrapStatus, AppStateError> {
+        let index = self.lock_search_index()?;
+        Ok(index.bootstrap_status())
+    }
+
     fn disconnect_if_connected(&self, device_id: &str) -> Result<(), AppStateError> {
         let runtime =
             {
@@ -332,8 +400,29 @@ impl AppState {
         Ok(())
     }
 
+    fn persist_search_index_locked(&self, index: &SearchIndex) -> Result<(), AppStateError> {
+        index
+            .persist_to_path(&self.search_index_path)
+            .map_err(|error| match error {
+                SearchIndexStorageError::Io(source) => AppStateError::PersistSearchIndex {
+                    path: self.search_index_path.display().to_string(),
+                    source,
+                },
+                SearchIndexStorageError::Parse(source) => AppStateError::ParseSearchIndex {
+                    path: self.search_index_path.display().to_string(),
+                    source,
+                },
+            })
+    }
+
     fn lock_inner(&self) -> Result<MutexGuard<'_, InnerState>, AppStateError> {
         self.inner.lock().map_err(|_| AppStateError::StatePoisoned)
+    }
+
+    fn lock_search_index(&self) -> Result<MutexGuard<'_, SearchIndex>, AppStateError> {
+        self.search_index
+            .lock()
+            .map_err(|_| AppStateError::SearchIndexPoisoned)
     }
 }
 
@@ -817,6 +906,15 @@ fn device_storage_path() -> PathBuf {
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."));
     base_dir.join("codex-session-monitor").join("devices.json")
+}
+
+fn search_index_storage_path() -> PathBuf {
+    let base_dir = dirs::data_local_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base_dir
+        .join("codex-session-monitor")
+        .join("search-index-v1.json")
 }
 
 fn load_devices(path: &Path) -> Result<HashMap<String, DeviceRecord>, AppStateError> {

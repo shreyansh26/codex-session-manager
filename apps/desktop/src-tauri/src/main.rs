@@ -4,7 +4,9 @@ mod commands;
 mod state;
 
 use commands::{
-    device_add_local, device_add_ssh, device_connect, device_disconnect, device_list, device_remove,
+    device_add_local, device_add_ssh, device_connect, device_disconnect, device_list,
+    device_remove, search_bootstrap_status, search_index_remove_device, search_index_upsert_thread,
+    search_query,
 };
 use state::app_state::AppState;
 
@@ -19,7 +21,11 @@ fn main() {
             device_list,
             device_connect,
             device_disconnect,
-            device_remove
+            device_remove,
+            search_index_upsert_thread,
+            search_index_remove_device,
+            search_query,
+            search_bootstrap_status
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Tauri application");

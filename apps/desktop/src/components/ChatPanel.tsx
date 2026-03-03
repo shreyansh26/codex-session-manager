@@ -7,6 +7,8 @@ interface ChatPanelProps {
   session: SessionSummary | null;
   messages: ChatMessage[];
   costDisplay: SessionCostDisplay;
+  scrollToMessageId?: string | null;
+  onScrollToMessageHandled?: (messageId: string) => void;
 }
 
 const numberFormatter = new Intl.NumberFormat("en-US");
@@ -69,10 +71,19 @@ const messageLabel = (message: ChatMessage): string => {
 
 const hasTextContent = (value: string): boolean => value.trim().length > 0;
 
-export default function ChatPanel({ session, messages, costDisplay }: ChatPanelProps) {
+export default function ChatPanel({
+  session,
+  messages,
+  costDisplay,
+  scrollToMessageId,
+  onScrollToMessageHandled
+}: ChatPanelProps) {
   const panelRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
+    if (scrollToMessageId) {
+      return;
+    }
     const panel = panelRef.current;
     if (!panel) {
       return;
@@ -85,7 +96,40 @@ export default function ChatPanel({ session, messages, costDisplay }: ChatPanelP
     return () => {
       window.cancelAnimationFrame(frameId);
     };
-  }, [session?.key, messages.length]);
+  }, [scrollToMessageId, session?.key, messages.length]);
+
+  useEffect(() => {
+    if (!scrollToMessageId) {
+      return;
+    }
+
+    const panel = panelRef.current;
+    if (!panel) {
+      return;
+    }
+
+    const frameId = window.requestAnimationFrame(() => {
+      const target = [...panel.querySelectorAll<HTMLElement>("[data-message-id]")]
+        .find((element) => element.dataset.messageId === scrollToMessageId);
+      if (!target) {
+        return;
+      }
+
+      target.scrollIntoView({
+        block: "center",
+        behavior: "smooth"
+      });
+      target.classList.add("bubble--search-target");
+      window.setTimeout(() => {
+        target.classList.remove("bubble--search-target");
+      }, 1300);
+      onScrollToMessageHandled?.(scrollToMessageId);
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frameId);
+    };
+  }, [messages, onScrollToMessageHandled, scrollToMessageId, session?.key]);
 
   if (!session) {
     return (
@@ -119,6 +163,7 @@ export default function ChatPanel({ session, messages, costDisplay }: ChatPanelP
         {messages.map((message, index) => (
           <li
             key={`${message.id}-${message.role}-${message.createdAt}-${index}`}
+            data-message-id={message.id}
             className={`bubble bubble--${message.role} ${
               message.eventType === "reasoning" && message.role !== "user"
                 ? "bubble--reasoning"
