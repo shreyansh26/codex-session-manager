@@ -304,6 +304,7 @@ dependencies = [
  "dirs 5.0.1",
  "serde",
  "serde_json",
+ "strsim",
  "tauri",
  "tauri-build",
  "thiserror 1.0.69",
