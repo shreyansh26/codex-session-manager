@@ -18,16 +18,21 @@ import type {
   SearchSessionHit,
   SessionSummary,
   ThinkingEffort,
+  ThreadHydrationState,
+  ThreadPayload,
+  ThreadRolloutPayload,
   TokenUsageBreakdown,
   ThreadTokenUsageState
 } from "../domain/types";
 import {
   closeAllClients,
   closeDeviceClient,
+  findLatestRolloutPathForThread,
   listDirectories,
   listModels,
   listThreads,
   readThreadUsageFromRollout,
+  readRolloutTimelineMessages,
   readAccount,
   readThread,
   resumeThread,
@@ -58,6 +63,10 @@ import type {
   SearchHydrationWorkerRequest,
   SearchHydrationWorkerResponse
 } from "../workers/searchHydrationProtocol";
+import type {
+  ThreadReadWorkerRequest,
+  ThreadReadWorkerResponse
+} from "../workers/threadReadProtocol";
 import { mergeSessions } from "./sessionMerge";
 
 interface AppStore {
@@ -66,6 +75,7 @@ interface AppStore {
   sessions: SessionSummary[];
   selectedSessionKey: string | null;
   messagesBySession: Record<string, ChatMessage[]>;
+  threadHydrationBySession: Record<string, ThreadHydrationState>;
   tokenUsageBySession: Record<string, ThreadTokenUsageState>;
   modelBySession: Record<string, string>;
   costUsdBySession: Record<string, number | null>;
@@ -87,7 +97,11 @@ interface AppStore {
   refreshThread: (
     deviceId: string,
     threadId: string,
-    options?: { preserveSummary?: boolean; skipMessages?: boolean }
+    options?: {
+      preserveSummary?: boolean;
+      skipMessages?: boolean;
+      hydrateRollout?: boolean;
+    }
   ) => Promise<void>;
   browseDeviceDirectories: (
     deviceId: string,
@@ -116,10 +130,18 @@ const USAGE_BACKFILL_MIN_INTERVAL_MS = 5_000;
 const PENDING_OPTIMISTIC_RETAIN_MS = 120_000;
 const OPTIMISTIC_ACK_CLOCK_SKEW_MS = 8_000;
 const OPTIMISTIC_ACK_MAX_DELAY_MS = 45_000;
-const SERVER_DUPLICATE_WINDOW_MS = 120_000;
+const SERVER_DUPLICATE_WINDOW_MS = 10_000;
 const SEARCH_SIMILARITY_THRESHOLD = 0.9;
 const SEARCH_MAX_SESSIONS = 10;
 const BACKGROUND_SEARCH_HYDRATION_DELAY_MS = 30;
+const BACKGROUND_SEARCH_HYDRATION_START_DELAY_MS = 1_500;
+const SEARCH_INDEX_FLUSH_DELAY_MS = 150;
+
+const DEFAULT_THREAD_HYDRATION_STATE: ThreadHydrationState = {
+  baseLoading: false,
+  baseLoaded: false,
+  toolHistoryLoading: false
+};
 
 const pickSelectedSession = (
   preferred: string | null,
@@ -169,27 +191,53 @@ const upsertMessage = (
   existing: ChatMessage[],
   incoming: ChatMessage
 ): ChatMessage[] => {
+  const normalizedIncoming = ensureTimelineOrder(existing, incoming);
   const existingIndex = existing.findIndex((entry) =>
-    isSameLogicalMessage(entry, incoming) ||
-    hasAcknowledgedEquivalent(entry, incoming) ||
-    isEquivalentServerMessage(entry, incoming)
+    isSameLogicalMessage(entry, normalizedIncoming) ||
+    hasAcknowledgedEquivalent(entry, normalizedIncoming) ||
+    isEquivalentServerMessage(entry, normalizedIncoming)
   );
   if (existingIndex === -1) {
-    return dedupeEquivalentServerMessages([...existing, incoming]);
+    return dedupeEquivalentServerMessages([...existing, normalizedIncoming]);
   }
 
   const current = existing[existingIndex];
-  const merged: ChatMessage = {
-    ...current,
-    ...incoming,
-    content: mergeMessageContent(current, incoming),
-    createdAt: pickLatestTimestamp(current.createdAt, incoming.createdAt)
-  };
+  const merged = mergeStoredMessage(current, normalizedIncoming);
 
   const next = [...existing];
   next[existingIndex] = merged;
   return dedupeEquivalentServerMessages(next);
 };
+
+const mergeStoredMessage = (
+  current: ChatMessage,
+  incoming: ChatMessage
+): ChatMessage => ({
+  ...current,
+  ...incoming,
+  content: mergeMessageContent(current, incoming),
+  createdAt: pickMergedTimestamp(current, incoming),
+  timelineOrder: pickMergedTimelineOrder(current, incoming),
+  toolCall: mergeToolCalls(current.toolCall, incoming.toolCall)
+});
+
+const ensureTimelineOrder = (
+  existing: ChatMessage[],
+  incoming: ChatMessage
+): ChatMessage =>
+  typeof incoming.timelineOrder === "number"
+    ? incoming
+    : {
+        ...incoming,
+        timelineOrder: nextTimelineOrder(existing)
+      };
+
+const nextTimelineOrder = (messages: ChatMessage[]): number =>
+  messages.reduce((maxOrder, message, index) => {
+    const candidate =
+      typeof message.timelineOrder === "number" ? message.timelineOrder : index;
+    return Math.max(maxOrder, candidate);
+  }, -1) + 1;
 
 const isStreamingMergeCandidate = (
   current: ChatMessage,
@@ -268,6 +316,91 @@ const imageSignature = (message: ChatMessage): string =>
     .filter((url) => url.length > 0)
     .join("|");
 
+const toolCallSignature = (message: ChatMessage): string =>
+  [
+    message.toolCall?.name?.trim() ?? "",
+    message.toolCall?.input?.trim() ?? "",
+    message.toolCall?.output?.trim() ?? "",
+    message.toolCall?.status ?? ""
+  ].join("|");
+
+const messageIdentityKey = (message: ChatMessage): string =>
+  [message.id, message.role, message.eventType ?? ""].join("::");
+
+const shouldPreserveEarliestUserTimestamp = (
+  current: ChatMessage,
+  incoming: ChatMessage
+): boolean =>
+  current.role === "user" &&
+  incoming.role === "user" &&
+  normalizeMessageText(current.content) === normalizeMessageText(incoming.content) &&
+  imageSignature(current) === imageSignature(incoming) &&
+  !current.toolCall &&
+  !incoming.toolCall;
+
+const mergeToolCalls = (
+  current: ChatMessage["toolCall"],
+  incoming: ChatMessage["toolCall"]
+): ChatMessage["toolCall"] => {
+  if (!current) {
+    return incoming;
+  }
+  if (!incoming) {
+    return current;
+  }
+
+  return {
+    name: choosePreferredToolName(current.name, incoming.name),
+    input:
+      preferLongerField(current.input, incoming.input) ??
+      incoming.input ??
+      current.input,
+    output:
+      preferLongerField(current.output, incoming.output) ??
+      incoming.output ??
+      current.output,
+    status: incoming.status ?? current.status
+  };
+};
+
+const choosePreferredToolName = (current: string, incoming: string): string => {
+  const currentGeneric = isGenericToolName(current);
+  const incomingGeneric = isGenericToolName(incoming);
+  if (!currentGeneric && incomingGeneric) {
+    return current;
+  }
+  if (currentGeneric && !incomingGeneric) {
+    return incoming;
+  }
+  return incoming.trim().length >= current.trim().length ? incoming : current;
+};
+
+const isGenericToolName = (value: string): boolean => {
+  const normalized = value.trim().toLowerCase();
+  return (
+    normalized === "tool" ||
+    normalized === "function_call" ||
+    normalized === "function_call_output" ||
+    normalized === "custom_tool_call" ||
+    normalized === "custom_tool_call_output" ||
+    normalized === "tool_call" ||
+    normalized === "tool_call_output"
+  );
+};
+
+const preferLongerField = (
+  current: string | undefined,
+  incoming: string | undefined
+): string | undefined => {
+  if (!current) {
+    return incoming;
+  }
+  if (!incoming) {
+    return current;
+  }
+  return incoming.length >= current.length ? incoming : current;
+};
+
 const isLikelyOptimisticAcknowledgement = (
   optimisticIso: string,
   incomingIso: string
@@ -333,10 +466,15 @@ const isEquivalentServerMessage = (
     return false;
   }
 
+  if (current.eventType === "tool_call" || incoming.eventType === "tool_call") {
+    return false;
+  }
+
   const sameContent =
     normalizeMessageText(current.content) === normalizeMessageText(incoming.content);
   const sameImages = imageSignature(current) === imageSignature(incoming);
-  if (!sameContent || !sameImages) {
+  const sameToolCall = toolCallSignature(current) === toolCallSignature(incoming);
+  if (!sameContent || !sameImages || !sameToolCall) {
     return false;
   }
 
@@ -365,6 +503,10 @@ const isSameLogicalMessage = (
     (current.eventType ?? "") !== (incoming.eventType ?? "")
   ) {
     return false;
+  }
+
+  if (current.eventType === "tool_call" && incoming.eventType === "tool_call") {
+    return true;
   }
 
   if (current.createdAt === incoming.createdAt) {
@@ -417,11 +559,83 @@ const pickLatestTimestamp = (a: string, b: string): string => {
   return bMs >= aMs ? b : a;
 };
 
+const pickEarliestTimestamp = (a: string, b: string): string => {
+  const aMs = Date.parse(a);
+  const bMs = Date.parse(b);
+
+  if (Number.isNaN(aMs)) {
+    return b;
+  }
+  if (Number.isNaN(bMs)) {
+    return a;
+  }
+  return aMs <= bMs ? a : b;
+};
+
+const pickMergedTimestamp = (
+  current: ChatMessage,
+  incoming: ChatMessage
+): string => {
+  if (shouldPreserveCurrentTimestamp(current, incoming)) {
+    return current.createdAt;
+  }
+
+  if (
+    hasAcknowledgedEquivalent(current, incoming) ||
+    shouldPreserveEarliestUserTimestamp(current, incoming)
+  ) {
+    return pickEarliestTimestamp(current.createdAt, incoming.createdAt);
+  }
+
+  return pickLatestTimestamp(current.createdAt, incoming.createdAt);
+};
+
+const pickMergedTimelineOrder = (
+  current: ChatMessage,
+  incoming: ChatMessage
+): number | undefined =>
+  typeof current.timelineOrder === "number"
+    ? current.timelineOrder
+    : incoming.timelineOrder;
+
+const shouldPreserveCurrentTimestamp = (
+  current: ChatMessage,
+  incoming: ChatMessage
+): boolean =>
+  current.id === incoming.id &&
+  current.role === incoming.role &&
+  (current.eventType ?? "") === (incoming.eventType ?? "");
+
+const normalizeLiveNotificationMessage = (
+  existing: ChatMessage[],
+  incoming: ChatMessage
+): ChatMessage => {
+  if (incoming.role === "user") {
+    return incoming;
+  }
+
+  const latest = existing.at(-1);
+  if (!latest) {
+    return incoming;
+  }
+
+  const latestMs = Date.parse(latest.createdAt);
+  const incomingMs = Date.parse(incoming.createdAt);
+  if (!Number.isFinite(latestMs) || !Number.isFinite(incomingMs) || incomingMs > latestMs) {
+    return incoming;
+  }
+
+  return {
+    ...incoming,
+    createdAt: new Date(latestMs + 1).toISOString()
+  };
+};
+
 const sortMessagesAscending = (a: ChatMessage, b: ChatMessage): number => {
   const aMs = Date.parse(a.createdAt);
   const bMs = Date.parse(b.createdAt);
   if (Number.isNaN(aMs) && Number.isNaN(bMs)) {
-    return 0;
+    return compareTimelineOrder(a, b);
   }
   if (Number.isNaN(aMs)) {
     return 1;
@@ -430,30 +644,79 @@ const sortMessagesAscending = (a: ChatMessage, b: ChatMessage): number => {
     return -1;
   }
   if (aMs === bMs) {
-    return 0;
+    return compareTimelineOrder(a, b);
   }
   return aMs - bMs;
+};
+
+const compareTimelineOrder = (a: ChatMessage, b: ChatMessage): number => {
+  if (
+    typeof a.timelineOrder === "number" &&
+    typeof b.timelineOrder === "number" &&
+    a.timelineOrder !== b.timelineOrder
+  ) {
+    return a.timelineOrder - b.timelineOrder;
+  }
+  return 0;
 };
 
 const preferCanonicalMessage = (
   current: ChatMessage,
   incoming: ChatMessage
 ): ChatMessage => {
+  const preserveTimelineOrder = (winner: ChatMessage): ChatMessage => ({
+    ...winner,
+    ...(typeof current.timelineOrder === "number"
+      ? { timelineOrder: current.timelineOrder }
+      : typeof incoming.timelineOrder === "number"
+        ? { timelineOrder: incoming.timelineOrder }
+        : {})
+  });
   const currentReasoning = current.eventType === "reasoning";
   const incomingReasoning = incoming.eventType === "reasoning";
   if (currentReasoning !== incomingReasoning) {
-    return incomingReasoning ? current : incoming;
+    return preserveTimelineOrder(incomingReasoning ? current : incoming);
   }
 
   const currentImages = current.images?.length ?? 0;
   const incomingImages = incoming.images?.length ?? 0;
   if (incomingImages !== currentImages) {
-    return incomingImages > currentImages ? incoming : current;
+    return preserveTimelineOrder(incomingImages > currentImages ? incoming : current);
   }
 
-  return pickLatestTimestamp(current.createdAt, incoming.createdAt) === incoming.createdAt
-    ? incoming
-    : current;
+  const currentToolRichness = toolCallCompletenessScore(current);
+  const incomingToolRichness = toolCallCompletenessScore(incoming);
+  if (incomingToolRichness !== currentToolRichness) {
+    return preserveTimelineOrder(
+      incomingToolRichness > currentToolRichness ? incoming : current
+    );
+  }
+
+  if (shouldPreserveEarliestUserTimestamp(current, incoming)) {
+    return preserveTimelineOrder(
+      pickEarliestTimestamp(current.createdAt, incoming.createdAt) === incoming.createdAt
+        ? incoming
+        : current
+    );
+  }
+
+  return preserveTimelineOrder(
+    pickLatestTimestamp(current.createdAt, incoming.createdAt) === incoming.createdAt
+      ? incoming
+      : current
+  );
+};
+
+const toolCallCompletenessScore = (message: ChatMessage): number => {
+  if (!message.toolCall) {
+    return 0;
+  }
+  return (
+    (message.toolCall.name.trim().length > 0 ? 1 : 0) +
+    (message.toolCall.input?.trim().length ? 1 : 0) +
+    (message.toolCall.output?.trim().length ? 2 : 0) +
+    (message.toolCall.status === "completed" || message.toolCall.status === "failed" ? 1 : 0)
+  );
 };
 
 const dedupeEquivalentServerMessages = (
@@ -473,44 +736,212 @@ const dedupeEquivalentServerMessages = (
   return deduped.sort(sortMessagesAscending);
 };
 
+const dedupeMessagesByIdentity = (messages: ChatMessage[]): ChatMessage[] => {
+  const mergedByIdentity = new Map<string, ChatMessage>();
+  const ordered = [...messages].sort(sortMessagesAscending);
+  for (const message of ordered) {
+    const identity = messageIdentityKey(message);
+    const existing = mergedByIdentity.get(identity);
+    mergedByIdentity.set(
+      identity,
+      existing ? mergeStoredMessage(existing, message) : message
+    );
+  }
+  return [...mergedByIdentity.values()].sort(sortMessagesAscending);
+};
+
+const normalizeSnapshotMessages = (messages: ChatMessage[]): ChatMessage[] =>
+  dedupeEquivalentServerMessages(dedupeMessagesByIdentity(messages));
+
+const hasMatchingMessage = (
+  messages: ChatMessage[],
+  candidate: ChatMessage
+): boolean =>
+  messages.some(
+    (entry) =>
+      isSameLogicalMessage(entry, candidate) ||
+      hasAcknowledgedEquivalent(candidate, entry) ||
+      isEquivalentServerMessage(entry, candidate)
+  );
+
+const pendingOptimisticUserMessages = (messages: ChatMessage[]): ChatMessage[] =>
+  messages.filter((message) => {
+    if (!isOptimisticMessage(message) || message.role !== "user") {
+      return false;
+    }
+
+    const createdAtMs = Date.parse(message.createdAt);
+    if (Number.isNaN(createdAtMs)) {
+      return false;
+    }
+
+    return Date.now() - createdAtMs <= PENDING_OPTIMISTIC_RETAIN_MS;
+  });
+
+const mergeSnapshotAcknowledgements = (
+  snapshotMessages: ChatMessage[],
+  existing: ChatMessage[]
+): {
+  snapshotMessages: ChatMessage[];
+  retainedOptimistic: ChatMessage[];
+} => {
+  const pendingOptimistic = pendingOptimisticUserMessages(existing);
+  if (pendingOptimistic.length === 0) {
+    return {
+      snapshotMessages,
+      retainedOptimistic: []
+    };
+  }
+
+  const matchedOptimisticIds = new Set<string>();
+  const mergedSnapshotMessages = snapshotMessages.map((message) => {
+    const optimisticMatch = pendingOptimistic.find((optimistic) =>
+      hasAcknowledgedEquivalent(optimistic, message)
+    );
+    if (!optimisticMatch) {
+      return message;
+    }
+
+    matchedOptimisticIds.add(optimisticMatch.id);
+    return mergeStoredMessage(optimisticMatch, message);
+  });
+
+  return {
+    snapshotMessages: mergedSnapshotMessages,
+    retainedOptimistic: pendingOptimistic.filter(
+      (message) => !matchedOptimisticIds.has(message.id)
+    )
+  };
+};
+
 const mergeThreadMessages = (
   existing: ChatMessage[],
   incoming: ChatMessage[]
 ): ChatMessage[] => {
-  let merged: ChatMessage[] = [];
-  const incomingSorted = [...incoming].sort(sortMessagesAscending);
-  for (const message of incomingSorted) {
-    merged = upsertMessage(merged, message);
-  }
-  const nowMs = Date.now();
+  const normalizedSnapshotMessages = normalizeSnapshotMessages(incoming);
+  const { snapshotMessages, retainedOptimistic } = mergeSnapshotAcknowledgements(
+    normalizedSnapshotMessages,
+    existing
+  );
+  return dedupeEquivalentServerMessages([
+    ...snapshotMessages,
+    ...retainedOptimistic
+  ]);
+};
 
-  for (const message of existing) {
-    const alreadyPresent = merged.some(
-      (entry) =>
-        isSameLogicalMessage(entry, message) ||
-        hasAcknowledgedEquivalent(message, entry) ||
-        isEquivalentServerMessage(entry, message)
+const mergeSnapshotMessagesIntoExisting = (
+  existing: ChatMessage[],
+  snapshotMessages: ChatMessage[]
+): ChatMessage[] =>
+  snapshotMessages.map((message) => {
+    const exact = existing.find(
+      (entry) => messageIdentityKey(entry) === messageIdentityKey(message)
     );
-    if (alreadyPresent) {
-      continue;
+    if (exact) {
+      return mergeStoredMessage(exact, message);
     }
 
-    const createdAtMs = Date.parse(message.createdAt);
-    const ageMs = Number.isNaN(createdAtMs) ? 0 : nowMs - createdAtMs;
-    const keepOptimisticPending =
-      isOptimisticMessage(message) &&
-      message.role === "user" &&
-      ageMs <= PENDING_OPTIMISTIC_RETAIN_MS;
-    const keepServerMessage = !isOptimisticMessage(message);
-
-    if (!keepOptimisticPending && !keepServerMessage) {
-      continue;
+    const logicalMatch = existing.find(
+      (entry) =>
+        isSameLogicalMessage(entry, message) || hasAcknowledgedEquivalent(entry, message)
+    );
+    if (logicalMatch) {
+      return mergeStoredMessage(logicalMatch, message);
     }
 
-    merged = upsertMessage(merged, message);
+    return message;
+  });
+
+const mergeSnapshotMessages = (
+  existing: ChatMessage[],
+  snapshot: ChatMessage[]
+): ChatMessage[] => {
+  const normalizedSnapshotMessages = normalizeSnapshotMessages(snapshot);
+  const { snapshotMessages: acknowledgedSnapshotMessages, retainedOptimistic } =
+    mergeSnapshotAcknowledgements(
+      normalizedSnapshotMessages,
+      existing
+    );
+  const snapshotMessages = mergeSnapshotMessagesIntoExisting(
+    existing,
+    acknowledgedSnapshotMessages
+  );
+  const retainedToolCalls = existing.filter(
+    (message) =>
+      message.eventType === "tool_call" && !hasMatchingMessage(snapshotMessages, message)
+  );
+
+  return dedupeEquivalentServerMessages([
+    ...snapshotMessages,
+    ...retainedToolCalls,
+    ...retainedOptimistic
+  ]);
+};
+
+const mergeRolloutEnrichmentMessages = (
+  existing: ChatMessage[],
+  enrichment: ChatMessage[]
+): ChatMessage[] => {
+  const mergedByIdentity = new Map<string, ChatMessage>();
+  for (const message of dedupeMessagesByIdentity(existing)) {
+    mergedByIdentity.set(messageIdentityKey(message), message);
   }
 
-  return dedupeEquivalentServerMessages(merged);
+  for (const message of normalizeSnapshotMessages(enrichment)) {
+    const identity = messageIdentityKey(message);
+    const exact = mergedByIdentity.get(identity);
+    if (exact) {
+      mergedByIdentity.set(identity, mergeStoredMessage(exact, message));
+      continue;
+    }
+
+    const logicalMatch = [...mergedByIdentity.values()].find((entry) =>
+      isSameLogicalMessage(entry, message) ||
+      hasAcknowledgedEquivalent(entry, message) ||
+      isEquivalentServerMessage(entry, message)
+    );
+
+    if (!logicalMatch) {
+      mergedByIdentity.set(identity, message);
+      continue;
+    }
+
+    mergedByIdentity.set(
+      messageIdentityKey(logicalMatch),
+      mergeStoredMessage(logicalMatch, message)
+    );
+  }
+
+  return dedupeEquivalentServerMessages([...mergedByIdentity.values()]);
+};
+
+const sameThreadHydrationState = (
+  current: ThreadHydrationState,
+  next: ThreadHydrationState
+): boolean =>
+  current.baseLoading === next.baseLoading &&
+  current.baseLoaded === next.baseLoaded &&
+  current.toolHistoryLoading === next.toolHistoryLoading &&
+  current.toolHistoryRevision === next.toolHistoryRevision;
+
+const updateThreadHydrationState = (
+  current: Record<string, ThreadHydrationState>,
+  sessionKey: string,
+  patch: Partial<ThreadHydrationState>
+): Record<string, ThreadHydrationState> => {
+  const previous = current[sessionKey] ?? DEFAULT_THREAD_HYDRATION_STATE;
+  const next: ThreadHydrationState = {
+    ...previous,
+    ...patch
+  };
+  if (sameThreadHydrationState(previous, next)) {
+    return current;
+  }
+
+  return {
+    ...current,
+    [sessionKey]: next
+  };
 };
 
 const normalizeSubmissionImages = (
@@ -704,7 +1135,7 @@ const pickString = (
   return null;
 };
 
-let shutdownSearchHydrationWorkerCallback: (() => void) | null = null;
+let shutdownWorkersCallback: (() => void) | null = null;
 
 export const useAppStore = create<AppStore>((set, get) => {
   const notificationRefreshAtMs = new Map<string, number>();
@@ -717,9 +1148,22 @@ export const useAppStore = create<AppStore>((set, get) => {
   let activeHydrationSessionKey: string | null = null;
   let completedHydrations = 0;
   let activeSearchRequestId = 0;
+  const activeSendSessionKeys = new Set<string>();
+  const activeThreadBaseLoads = new Set<string>();
+  const activeThreadRolloutLoads = new Set<string>();
+  let searchHydrationStartTimer: ReturnType<typeof setTimeout> | null = null;
+  let searchIndexFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  const queuedSearchIndexPayloads = new Map<string, SearchIndexThreadPayload>();
   let searchHydrationWorker: Worker | null = null;
   let searchHydrationWorkerUnavailable = false;
   let nextSearchHydrationWorkerRequestId = 1;
+  let threadReadWorker: Worker | null = null;
+  let threadReadWorkerUnavailable = false;
+  let nextThreadReadWorkerRequestId = 1;
+  let nextThreadBaseLoadToken = 1;
+  let nextThreadRolloutLoadToken = 1;
+  const latestThreadBaseRequestIdBySession = new Map<string, number>();
+  const latestThreadRolloutRequestIdBySession = new Map<string, number>();
   const pendingSearchHydrationWorkerRequests = new Map<
     number,
     {
@@ -728,6 +1172,33 @@ export const useAppStore = create<AppStore>((set, get) => {
       reject: (error: Error) => void;
     }
   >();
+  const pendingThreadBaseWorkerRequests = new Map<
+    number,
+    {
+      sessionKey: string;
+      resolve: (payload: ThreadPayload) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+  const pendingThreadRolloutWorkerRequests = new Map<
+    number,
+    {
+      sessionKey: string;
+      revision?: string;
+      resolve: (payload: ThreadRolloutPayload) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+
+  const hasInteractiveThreadWork = (): boolean =>
+    activeThreadBaseLoads.size > 0 ||
+    activeThreadRolloutLoads.size > 0 ||
+    activeSendSessionKeys.size > 0;
+
+  const shouldPublishSearchHydrationProgress = (): boolean => {
+    const state = get();
+    return state.searchLoading || state.searchResults.length > 0 || state.searchTotalHits > 0;
+  };
 
   const rejectPendingSearchHydrationWorkerRequests = (error: Error): void => {
     for (const pending of pendingSearchHydrationWorkerRequests.values()) {
@@ -736,24 +1207,80 @@ export const useAppStore = create<AppStore>((set, get) => {
     pendingSearchHydrationWorkerRequests.clear();
   };
 
+  const rejectPendingThreadReadWorkerRequests = (error: Error): void => {
+    for (const pending of pendingThreadBaseWorkerRequests.values()) {
+      pending.reject(error);
+    }
+    pendingThreadBaseWorkerRequests.clear();
+    for (const pending of pendingThreadRolloutWorkerRequests.values()) {
+      pending.reject(error);
+    }
+    pendingThreadRolloutWorkerRequests.clear();
+  };
+
   const handleSearchHydrationWorkerResponse = (
     response: SearchHydrationWorkerResponse
   ): void => {
-    const pending = pendingSearchHydrationWorkerRequests.get(response.requestId);
-    if (!pending) {
-      return;
-    }
-    pendingSearchHydrationWorkerRequests.delete(response.requestId);
-
     if (response.type === "hydrated-session") {
+      const pending = pendingSearchHydrationWorkerRequests.get(response.requestId);
+      if (!pending) {
+        return;
+      }
+      pendingSearchHydrationWorkerRequests.delete(response.requestId);
       pending.resolve(response.payload);
       return;
     }
 
-    pending.reject(
-      new Error(
-        response.error || `Failed to hydrate search session ${response.sessionKey}.`
-      )
+    const pendingHydration = pendingSearchHydrationWorkerRequests.get(response.requestId);
+    if (pendingHydration) {
+      pendingSearchHydrationWorkerRequests.delete(response.requestId);
+      pendingHydration.reject(
+        new Error(
+          response.error || `Failed to hydrate search session ${response.sessionKey}.`
+        )
+      );
+    }
+  };
+
+  const handleThreadReadWorkerResponse = (
+    response: ThreadReadWorkerResponse
+  ): void => {
+    if (response.type === "thread-base-read") {
+      const pending = pendingThreadBaseWorkerRequests.get(response.requestId);
+      if (!pending) {
+        return;
+      }
+      pendingThreadBaseWorkerRequests.delete(response.requestId);
+      pending.resolve(response.payload);
+      return;
+    }
+
+    if (response.type === "thread-rollout-read") {
+      const pending = pendingThreadRolloutWorkerRequests.get(response.requestId);
+      if (!pending) {
+        return;
+      }
+      pendingThreadRolloutWorkerRequests.delete(response.requestId);
+      pending.resolve(response.payload);
+      return;
+    }
+
+    const pendingBase = pendingThreadBaseWorkerRequests.get(response.requestId);
+    if (pendingBase) {
+      pendingThreadBaseWorkerRequests.delete(response.requestId);
+      pendingBase.reject(
+        new Error(response.error || `Failed to read thread ${response.sessionKey}.`)
+      );
+      return;
+    }
+
+    const pendingRollout = pendingThreadRolloutWorkerRequests.get(response.requestId);
+    if (!pendingRollout) {
+      return;
+    }
+    pendingThreadRolloutWorkerRequests.delete(response.requestId);
+    pendingRollout.reject(
+      new Error(response.error || `Failed to hydrate thread ${response.sessionKey}.`)
     );
   };
 
@@ -790,6 +1317,39 @@ export const useAppStore = create<AppStore>((set, get) => {
       return searchHydrationWorker;
     } catch {
       searchHydrationWorkerUnavailable = true;
+      return null;
+    }
+  };
+
+  const ensureThreadReadWorker = (): Worker | null => {
+    if (threadReadWorkerUnavailable) {
+      return null;
+    }
+    if (threadReadWorker) {
+      return threadReadWorker;
+    }
+    if (typeof Worker !== "function") {
+      threadReadWorkerUnavailable = true;
+      return null;
+    }
+
+    try {
+      threadReadWorker = new Worker(new URL("../workers/threadReadWorker.ts", import.meta.url), {
+        type: "module"
+      });
+      threadReadWorker.onmessage = (event: MessageEvent<ThreadReadWorkerResponse>) => {
+        handleThreadReadWorkerResponse(event.data);
+      };
+      threadReadWorker.onerror = (event): void => {
+        const message = event.message?.trim() || "Thread read worker crashed unexpectedly.";
+        threadReadWorkerUnavailable = true;
+        rejectPendingThreadReadWorkerRequests(new Error(message));
+        threadReadWorker?.terminate();
+        threadReadWorker = null;
+      };
+      return threadReadWorker;
+    } catch {
+      threadReadWorkerUnavailable = true;
       return null;
     }
   };
@@ -831,6 +1391,87 @@ export const useAppStore = create<AppStore>((set, get) => {
     });
   };
 
+  const requestThreadBaseReadFromWorker = async (
+    device: DeviceRecord,
+    threadId: string,
+    skipMessages = false
+  ): Promise<ThreadPayload | null> => {
+    const worker = ensureThreadReadWorker();
+    if (!worker) {
+      return null;
+    }
+
+    const requestId = nextThreadReadWorkerRequestId;
+    nextThreadReadWorkerRequestId += 1;
+    const request: ThreadReadWorkerRequest = {
+      type: "read-thread-base",
+      requestId,
+      device,
+      threadId,
+      ...(skipMessages ? { skipMessages: true } : {})
+    };
+
+    return new Promise<ThreadPayload>((resolve, reject) => {
+      pendingThreadBaseWorkerRequests.set(requestId, {
+        sessionKey: makeSessionKey(device.id, threadId),
+        resolve,
+        reject
+      });
+      try {
+        worker.postMessage(request);
+      } catch (error) {
+        pendingThreadBaseWorkerRequests.delete(requestId);
+        reject(
+          error instanceof Error
+            ? error
+            : new Error("Failed to post thread base read request to worker.")
+        );
+      }
+    });
+  };
+
+  const requestThreadRolloutFromWorker = async (
+    device: DeviceRecord,
+    threadId: string,
+    rolloutPath: string,
+    revision?: string
+  ): Promise<ThreadRolloutPayload | null> => {
+    const worker = ensureThreadReadWorker();
+    if (!worker) {
+      return null;
+    }
+
+    const requestId = nextThreadReadWorkerRequestId;
+    nextThreadReadWorkerRequestId += 1;
+    const request: ThreadReadWorkerRequest = {
+      type: "read-thread-rollout",
+      requestId,
+      device,
+      threadId,
+      rolloutPath,
+      ...(revision ? { revision } : {})
+    };
+
+    return new Promise<ThreadRolloutPayload>((resolve, reject) => {
+      pendingThreadRolloutWorkerRequests.set(requestId, {
+        sessionKey: makeSessionKey(device.id, threadId),
+        ...(revision ? { revision } : {}),
+        resolve,
+        reject
+      });
+      try {
+        worker.postMessage(request);
+      } catch (error) {
+        pendingThreadRolloutWorkerRequests.delete(requestId);
+        reject(
+          error instanceof Error
+            ? error
+            : new Error("Failed to post thread rollout request to worker.")
+        );
+      }
+    });
+  };
+
   const closeSearchHydrationWorkerDevice = (deviceId: string): void => {
     if (!searchHydrationWorker) {
       return;
@@ -846,6 +1487,21 @@ export const useAppStore = create<AppStore>((set, get) => {
     }
   };
 
+  const closeThreadReadWorkerDevice = (deviceId: string): void => {
+    if (!threadReadWorker) {
+      return;
+    }
+    const request: ThreadReadWorkerRequest = {
+      type: "close-device",
+      deviceId
+    };
+    try {
+      threadReadWorker.postMessage(request);
+    } catch {
+      // Non-critical cleanup.
+    }
+  };
+
   const shutdownSearchHydrationWorker = (): void => {
     if (!searchHydrationWorker) {
       return;
@@ -856,20 +1512,59 @@ export const useAppStore = create<AppStore>((set, get) => {
     } catch {
       // Ignore shutdown message failures and terminate directly.
     }
-    rejectPendingSearchHydrationWorkerRequests(
-      new Error("Search hydration worker was shut down.")
-    );
+    rejectPendingSearchHydrationWorkerRequests(new Error("Search hydration worker was shut down."));
     searchHydrationWorker.terminate();
     searchHydrationWorker = null;
+  };
+
+  const shutdownThreadReadWorker = (): void => {
+    if (!threadReadWorker) {
+      return;
+    }
+    try {
+      const request: ThreadReadWorkerRequest = { type: "shutdown" };
+      threadReadWorker.postMessage(request);
+    } catch {
+      // Ignore shutdown message failures and terminate directly.
+    }
+    rejectPendingThreadReadWorkerRequests(new Error("Thread read worker was shut down."));
+    threadReadWorker.terminate();
+    threadReadWorker = null;
   };
 
   const hydrateSessionOnMainThread = async (
     device: DeviceRecord,
     session: SessionSummary
   ): Promise<SearchIndexThreadPayload> => {
-    const payload = await readThread(device, session.threadId);
+    const payload = await readThread(device, session.threadId, {
+      includeRolloutMessages: false
+    });
     return toSearchIndexThreadPayload(payload.session, payload.messages);
   };
+
+  const readThreadBaseOnMainThread = async (
+    device: DeviceRecord,
+    threadId: string,
+    skipMessages = false
+  ): Promise<ThreadPayload> =>
+    readThread(device, threadId, {
+      includeRolloutMessages: false,
+      ...(skipMessages ? { skipMessages: true } : {})
+    });
+
+  const readThreadRolloutOnMainThread = async (
+    device: DeviceRecord,
+    threadId: string,
+    rolloutPath: string,
+    revision?: string
+  ): Promise<ThreadRolloutPayload> => ({
+    sessionKey: makeSessionKey(device.id, threadId),
+    threadId,
+    deviceId: device.id,
+    messages: await readRolloutTimelineMessages(device, threadId, rolloutPath, revision),
+    ...(revision ? { revision } : {}),
+    rolloutPath
+  });
 
   const hydrateSessionSearchPayload = async (
     device: DeviceRecord,
@@ -882,7 +1577,21 @@ export const useAppStore = create<AppStore>((set, get) => {
     return hydrateSessionOnMainThread(device, session);
   };
 
-  shutdownSearchHydrationWorkerCallback = shutdownSearchHydrationWorker;
+  const shutdownWorkers = (): void => {
+    if (searchHydrationStartTimer !== null) {
+      clearTimeout(searchHydrationStartTimer);
+      searchHydrationStartTimer = null;
+    }
+    if (searchIndexFlushTimer !== null) {
+      clearTimeout(searchIndexFlushTimer);
+      searchIndexFlushTimer = null;
+    }
+    queuedSearchIndexPayloads.clear();
+    shutdownSearchHydrationWorker();
+    shutdownThreadReadWorker();
+  };
+
+  shutdownWorkersCallback = shutdownWorkers;
 
   const stopPostSendRefresh = (sessionKey: string): void => {
     const pendingTimer = postSendRefreshTimers.get(sessionKey);
@@ -937,6 +1646,15 @@ export const useAppStore = create<AppStore>((set, get) => {
     }
   };
 
+  const clearQueuedSearchIndexPayloadsForDevice = (deviceId: string): void => {
+    const prefix = `${deviceId}::`;
+    for (const sessionKey of [...queuedSearchIndexPayloads.keys()]) {
+      if (sessionKey.startsWith(prefix)) {
+        queuedSearchIndexPayloads.delete(sessionKey);
+      }
+    }
+  };
+
   const rejectPendingSearchHydrationWorkerRequestsForDevice = (
     deviceId: string
   ): void => {
@@ -947,6 +1665,20 @@ export const useAppStore = create<AppStore>((set, get) => {
       }
       pendingSearchHydrationWorkerRequests.delete(requestId);
       pending.reject(new Error(`Device ${deviceId} disconnected during search hydration.`));
+    }
+    for (const [requestId, pending] of pendingThreadBaseWorkerRequests) {
+      if (!pending.sessionKey.startsWith(prefix)) {
+        continue;
+      }
+      pendingThreadBaseWorkerRequests.delete(requestId);
+      pending.reject(new Error(`Device ${deviceId} disconnected during thread read.`));
+    }
+    for (const [requestId, pending] of pendingThreadRolloutWorkerRequests) {
+      if (!pending.sessionKey.startsWith(prefix)) {
+        continue;
+      }
+      pendingThreadRolloutWorkerRequests.delete(requestId);
+      pending.reject(new Error(`Device ${deviceId} disconnected during thread read.`));
     }
   };
 
@@ -1010,18 +1742,89 @@ export const useAppStore = create<AppStore>((set, get) => {
     });
   };
 
-  const upsertThreadIntoSearchIndex = (
+  const setThreadHydrationFlags = (
+    sessionKey: string,
+    patch: Partial<ThreadHydrationState>
+  ): void => {
+    set((state) => {
+      const nextThreadHydrationBySession = updateThreadHydrationState(
+        state.threadHydrationBySession,
+        sessionKey,
+        patch
+      );
+      if (nextThreadHydrationBySession === state.threadHydrationBySession) {
+        return {};
+      }
+
+      return {
+        threadHydrationBySession: nextThreadHydrationBySession
+      };
+    });
+  };
+
+  const flushQueuedSearchIndexPayloads = (): void => {
+    if (searchIndexFlushTimer !== null) {
+      clearTimeout(searchIndexFlushTimer);
+      searchIndexFlushTimer = null;
+    }
+
+    if (queuedSearchIndexPayloads.size === 0) {
+      return;
+    }
+
+    if (hasInteractiveThreadWork()) {
+      searchIndexFlushTimer = setTimeout(
+        flushQueuedSearchIndexPayloads,
+        SEARCH_INDEX_FLUSH_DELAY_MS
+      );
+      return;
+    }
+
+    const nextEntry = queuedSearchIndexPayloads.entries().next().value as
+      | [string, SearchIndexThreadPayload]
+      | undefined;
+    if (!nextEntry) {
+      return;
+    }
+
+    const [sessionKey, payload] = nextEntry;
+    queuedSearchIndexPayloads.delete(sessionKey);
+    void searchIndexUpsertThread(payload)
+      .catch(() => {
+        // Keep search functional even if persistence/indexing fails on one update.
+      })
+      .finally(() => {
+        if (queuedSearchIndexPayloads.size === 0) {
+          searchIndexFlushTimer = null;
+          return;
+        }
+        searchIndexFlushTimer = setTimeout(
+          flushQueuedSearchIndexPayloads,
+          SEARCH_INDEX_FLUSH_DELAY_MS
+        );
+      });
+  };
+
+  const queueThreadIntoSearchIndex = (
     session: SessionSummary,
     messages: ChatMessage[]
   ): void => {
     hydratedSearchSessions.add(session.key);
     const payload = toSearchIndexThreadPayload(session, messages);
-    void searchIndexUpsertThread(payload).catch(() => {
-      // Keep search functional even if persistence/indexing fails on one update.
-    });
+    queuedSearchIndexPayloads.set(session.key, payload);
+    if (searchIndexFlushTimer !== null) {
+      return;
+    }
+    searchIndexFlushTimer = setTimeout(
+      flushQueuedSearchIndexPayloads,
+      SEARCH_INDEX_FLUSH_DELAY_MS
+    );
   };
 
   const syncSearchHydrationProgress = (): void => {
+    if (!shouldPublishSearchHydrationProgress()) {
+      return;
+    }
     const pendingCount =
       queuedSearchHydrationSessions.size + (activeHydrationSessionKey ? 1 : 0);
     const total = completedHydrations + pendingCount;
@@ -1036,12 +1839,25 @@ export const useAppStore = create<AppStore>((set, get) => {
     if (searchHydrationPromise || queuedSearchHydrationSessions.size === 0) {
       return;
     }
+    if (hasInteractiveThreadWork()) {
+      if (searchHydrationStartTimer === null) {
+        searchHydrationStartTimer = setTimeout(() => {
+          searchHydrationStartTimer = null;
+          startBackgroundSearchHydration();
+        }, BACKGROUND_SEARCH_HYDRATION_START_DELAY_MS);
+      }
+      return;
+    }
 
     completedHydrations = 0;
     syncSearchHydrationProgress();
 
     searchHydrationPromise = (async () => {
       while (queuedSearchHydrationSessions.size > 0) {
+        if (hasInteractiveThreadWork()) {
+          break;
+        }
+
         const nextSessionKey = queuedSearchHydrationSessions.values().next()
           .value as string | undefined;
         if (!nextSessionKey) {
@@ -1093,11 +1909,13 @@ export const useAppStore = create<AppStore>((set, get) => {
         activeHydrationSessionKey = null;
         searchHydrationPromise = null;
         completedHydrations = 0;
-        set({
-          searchHydrating: false,
-          searchHydratedCount: 0,
-          searchHydrationTotal: 0
-        });
+        if (shouldPublishSearchHydrationProgress()) {
+          set({
+            searchHydrating: false,
+            searchHydratedCount: 0,
+            searchHydrationTotal: 0
+          });
+        }
 
         if (queuedSearchHydrationSessions.size > 0) {
           startBackgroundSearchHydration();
@@ -1125,8 +1943,10 @@ export const useAppStore = create<AppStore>((set, get) => {
       return;
     }
 
-    syncSearchHydrationProgress();
     startBackgroundSearchHydration();
+    if (shouldPublishSearchHydrationProgress()) {
+      syncSearchHydrationProgress();
+    }
   };
 
   const startPostSendRefreshBurst = (params: {
@@ -1139,7 +1959,8 @@ export const useAppStore = create<AppStore>((set, get) => {
     for (const delayMs of POST_SEND_REFRESH_INITIAL_DELAYS_MS) {
       setTimeout(() => {
         void get().refreshThread(params.deviceId, params.threadId, {
-          preserveSummary: true
+          preserveSummary: true,
+          hydrateRollout: false
         });
       }, delayMs);
     }
@@ -1147,7 +1968,8 @@ export const useAppStore = create<AppStore>((set, get) => {
     const startedAt = Date.now();
     const tick = (): void => {
       void get().refreshThread(params.deviceId, params.threadId, {
-        preserveSummary: true
+        preserveSummary: true,
+        hydrateRollout: false
       });
 
       if (Date.now() - startedAt >= POST_SEND_REFRESH_BURST_MS) {
@@ -1178,7 +2000,15 @@ export const useAppStore = create<AppStore>((set, get) => {
     void (async () => {
       const snapshot = get();
       const existingUsage = snapshot.tokenUsageBySession[params.sessionKey];
-      if (existingUsage && existingUsage.threadId === params.threadId) {
+      const existingModel = snapshot.modelBySession[params.sessionKey];
+      const existingCost = snapshot.costUsdBySession[params.sessionKey];
+      if (
+        existingUsage &&
+        existingUsage.threadId === params.threadId &&
+        typeof existingModel === "string" &&
+        existingModel.trim().length > 0 &&
+        typeof existingCost === "number"
+      ) {
         return;
       }
 
@@ -1246,6 +2076,204 @@ export const useAppStore = create<AppStore>((set, get) => {
     })();
   };
 
+  const hydrateSelectedThreadRollout = async (params: {
+    device: DeviceRecord;
+    sessionKey: string;
+    threadId: string;
+    rolloutPath: string;
+    revision?: string;
+  }): Promise<void> => {
+    const requestToken = nextThreadRolloutLoadToken;
+    nextThreadRolloutLoadToken += 1;
+    latestThreadRolloutRequestIdBySession.set(params.sessionKey, requestToken);
+    activeThreadRolloutLoads.add(params.sessionKey);
+    setThreadHydrationFlags(params.sessionKey, { toolHistoryLoading: true });
+
+    try {
+      const payload =
+        (await requestThreadRolloutFromWorker(
+          params.device,
+          params.threadId,
+          params.rolloutPath,
+          params.revision
+        )) ??
+        (await readThreadRolloutOnMainThread(
+          params.device,
+          params.threadId,
+          params.rolloutPath,
+          params.revision
+        ));
+
+      if (latestThreadRolloutRequestIdBySession.get(params.sessionKey) !== requestToken) {
+        return;
+      }
+      if (get().selectedSessionKey !== params.sessionKey) {
+        return;
+      }
+
+      set((state) => ({
+        messagesBySession: {
+          ...state.messagesBySession,
+          [params.sessionKey]: mergeRolloutEnrichmentMessages(
+            state.messagesBySession[params.sessionKey] ?? [],
+            payload.messages
+          )
+        },
+        threadHydrationBySession: updateThreadHydrationState(
+          state.threadHydrationBySession,
+          params.sessionKey,
+          {
+            toolHistoryLoading: false,
+            toolHistoryRevision: payload.revision ?? params.revision
+          }
+        )
+      }));
+    } catch {
+      if (latestThreadRolloutRequestIdBySession.get(params.sessionKey) === requestToken) {
+        setThreadHydrationFlags(params.sessionKey, { toolHistoryLoading: false });
+      }
+    } finally {
+      activeThreadRolloutLoads.delete(params.sessionKey);
+      if (latestThreadRolloutRequestIdBySession.get(params.sessionKey) === requestToken) {
+        latestThreadRolloutRequestIdBySession.delete(params.sessionKey);
+        setThreadHydrationFlags(params.sessionKey, { toolHistoryLoading: false });
+      }
+      flushQueuedSearchIndexPayloads();
+      startBackgroundSearchHydration();
+    }
+  };
+
+  const refreshThreadBase = async (
+    device: DeviceRecord,
+    threadId: string,
+    options?: { preserveSummary?: boolean; skipMessages?: boolean; hydrateRollout?: boolean }
+  ): Promise<ThreadPayload> => {
+    const sessionKey = makeSessionKey(device.id, threadId);
+    const requestToken = nextThreadBaseLoadToken;
+    nextThreadBaseLoadToken += 1;
+    latestThreadBaseRequestIdBySession.set(sessionKey, requestToken);
+    activeThreadBaseLoads.add(sessionKey);
+
+    setThreadHydrationFlags(sessionKey, {
+      baseLoading: true,
+      ...(options?.skipMessages
+        ? {}
+        : {
+            toolHistoryLoading: false
+          })
+    });
+
+    try {
+      const payload =
+        (await requestThreadBaseReadFromWorker(device, threadId, options?.skipMessages)) ??
+        (await readThreadBaseOnMainThread(device, threadId, options?.skipMessages));
+
+      if (latestThreadBaseRequestIdBySession.get(sessionKey) !== requestToken) {
+        return payload;
+      }
+
+      set((state) => {
+        const nextSessions =
+          options?.preserveSummary &&
+          state.sessions.some((session) => session.key === payload.session.key)
+            ? state.sessions
+            : mergeSessions(state.sessions, [payload.session]);
+        const nextModelBySession = payload.model
+          ? {
+              ...state.modelBySession,
+              [payload.session.key]: payload.model
+            }
+          : state.modelBySession;
+        const nextCostUsdBySession = payload.model
+          ? {
+              ...state.costUsdBySession,
+              [payload.session.key]: computeSessionCostUsd(
+                payload.model,
+                state.tokenUsageBySession[payload.session.key]
+              )
+            }
+          : state.costUsdBySession;
+        const nextMessagesBySession = options?.skipMessages
+          ? state.messagesBySession
+          : {
+              ...state.messagesBySession,
+              [payload.session.key]: mergeSnapshotMessages(
+                state.messagesBySession[payload.session.key] ?? [],
+                payload.messages
+              )
+            };
+        const nextThreadHydrationBySession = updateThreadHydrationState(
+          state.threadHydrationBySession,
+          payload.session.key,
+          {
+            baseLoading: false,
+            baseLoaded:
+              (state.messagesBySession[payload.session.key] ?? []).length > 0 ||
+              !options?.skipMessages,
+            toolHistoryLoading: false
+          }
+        );
+
+        return {
+          sessions: nextSessions,
+          modelBySession: nextModelBySession,
+          costUsdBySession: nextCostUsdBySession,
+          messagesBySession: nextMessagesBySession,
+          threadHydrationBySession: nextThreadHydrationBySession
+        };
+      });
+
+      backfillUsageFromRollout({
+        sessionKey: payload.session.key,
+        deviceId: device.id,
+        threadId
+      });
+
+      if (!options?.skipMessages) {
+        const indexedMessages =
+          get().messagesBySession[payload.session.key] ?? payload.messages;
+        queueThreadIntoSearchIndex(payload.session, indexedMessages);
+      }
+
+      const rolloutPath =
+        !options?.skipMessages && options?.hydrateRollout !== false
+          ? payload.rolloutPath ?? (await findLatestRolloutPathForThread(device, threadId))
+          : payload.rolloutPath;
+
+      const shouldHydrateRollout =
+        !options?.skipMessages &&
+        options?.hydrateRollout !== false &&
+        get().selectedSessionKey === payload.session.key &&
+        get().threadHydrationBySession[payload.session.key]?.toolHistoryRevision !==
+          payload.session.updatedAt &&
+        typeof rolloutPath === "string" &&
+        rolloutPath.trim().length > 0;
+
+      if (shouldHydrateRollout) {
+        void hydrateSelectedThreadRollout({
+          device,
+          sessionKey: payload.session.key,
+          threadId,
+          rolloutPath: rolloutPath ?? "",
+          revision: payload.session.updatedAt
+        });
+      } else {
+        setThreadHydrationFlags(payload.session.key, {
+          toolHistoryLoading: false
+        });
+      }
+
+      return payload;
+    } finally {
+      activeThreadBaseLoads.delete(sessionKey);
+      if (latestThreadBaseRequestIdBySession.get(sessionKey) === requestToken) {
+        latestThreadBaseRequestIdBySession.delete(sessionKey);
+      }
+      flushQueuedSearchIndexPayloads();
+      startBackgroundSearchHydration();
+    }
+  };
+
   const refreshThreadFromNotification = (
     deviceId: string,
     notification: RpcNotification
@@ -1275,6 +2303,9 @@ export const useAppStore = create<AppStore>((set, get) => {
     }
 
     const sessionKey = makeSessionKey(deviceId, threadId);
+    if (get().selectedSessionKey !== sessionKey) {
+      return;
+    }
     const nowMs = Date.now();
     const lastRefreshMs = notificationRefreshAtMs.get(sessionKey) ?? 0;
     if (nowMs - lastRefreshMs < NOTIFICATION_REFRESH_MIN_INTERVAL_MS) {
@@ -1282,7 +2313,10 @@ export const useAppStore = create<AppStore>((set, get) => {
     }
     notificationRefreshAtMs.set(sessionKey, nowMs);
 
-    void get().refreshThread(deviceId, threadId, { preserveSummary: true });
+    void get().refreshThread(deviceId, threadId, {
+      preserveSummary: true,
+      hydrateRollout: false
+    });
   };
 
   const applyNotification = (deviceId: string, notification: RpcNotification): void => {
@@ -1388,7 +2422,10 @@ export const useAppStore = create<AppStore>((set, get) => {
         parsed.threadId
       );
       const current = state.messagesBySession[resolvedSessionKey] ?? [];
-      const next = upsertMessage(current, parsed.message);
+      const next = upsertMessage(
+        current,
+        normalizeLiveNotificationMessage(current, parsed.message)
+      );
       return {
         messagesBySession: {
           ...state.messagesBySession,
@@ -1419,6 +2456,7 @@ export const useAppStore = create<AppStore>((set, get) => {
     sessions: [],
     selectedSessionKey: null,
     messagesBySession: {},
+    threadHydrationBySession: {},
     tokenUsageBySession: {},
     modelBySession: {},
     costUsdBySession: {},
@@ -1509,7 +2547,6 @@ export const useAppStore = create<AppStore>((set, get) => {
         }
 
         await get().refreshSessions();
-        scheduleBackgroundSearchHydration(get().sessions);
       } catch (error) {
         set({ globalError: toErrorMessage(error) });
       } finally {
@@ -1519,13 +2556,17 @@ export const useAppStore = create<AppStore>((set, get) => {
     selectSession: async (sessionKey) => {
       set({ selectedSessionKey: sessionKey });
       ensureComposerPreferenceForSession(sessionKey);
+      setThreadHydrationFlags(sessionKey, {
+        baseLoaded: (get().messagesBySession[sessionKey] ?? []).length > 0
+      });
       const selected = get().sessions.find((session) => session.key === sessionKey);
       if (!selected) {
         return;
       }
 
       await get().refreshThread(selected.deviceId, selected.threadId, {
-        preserveSummary: true
+        preserveSummary: true,
+        hydrateRollout: true
       });
     },
     refreshSessions: async () => {
@@ -1581,8 +2622,9 @@ export const useAppStore = create<AppStore>((set, get) => {
         ensureComposerPreferenceForSession(selected);
         const session = get().sessions.find((entry) => entry.key === selected);
         if (session) {
-          await get().refreshThread(session.deviceId, session.threadId, {
-            preserveSummary: true
+          void get().refreshThread(session.deviceId, session.threadId, {
+            preserveSummary: true,
+            hydrateRollout: true
           });
         }
       }
@@ -1673,56 +2715,12 @@ export const useAppStore = create<AppStore>((set, get) => {
       }
 
       try {
-        const payload = await readThread(device, threadId);
-        set((state) => {
-          const nextSessions =
-            options?.preserveSummary &&
-            state.sessions.some((session) => session.key === payload.session.key)
-              ? state.sessions
-              : mergeSessions(state.sessions, [payload.session]);
-          const nextModelBySession = payload.model
-            ? {
-                ...state.modelBySession,
-                [payload.session.key]: payload.model
-              }
-            : state.modelBySession;
-          const nextCostUsdBySession = payload.model
-            ? {
-                ...state.costUsdBySession,
-                [payload.session.key]: computeSessionCostUsd(
-                  payload.model,
-                  state.tokenUsageBySession[payload.session.key]
-                )
-              }
-            : state.costUsdBySession;
-          return {
-            sessions: nextSessions,
-            modelBySession: nextModelBySession,
-            costUsdBySession: nextCostUsdBySession,
-            messagesBySession: options?.skipMessages
-              ? state.messagesBySession
-              : {
-                  ...state.messagesBySession,
-                  [payload.session.key]: mergeThreadMessages(
-                    state.messagesBySession[payload.session.key] ?? [],
-                    payload.messages
-                  )
-            }
-          };
-        });
-
-        backfillUsageFromRollout({
-          sessionKey: payload.session.key,
-          deviceId,
-          threadId
-        });
-
-        if (!options?.skipMessages) {
-          const indexedMessages =
-            get().messagesBySession[payload.session.key] ?? payload.messages;
-          upsertThreadIntoSearchIndex(payload.session, indexedMessages);
-        }
+        await refreshThreadBase(device, threadId, options);
       } catch (error) {
+        setThreadHydrationFlags(makeSessionKey(deviceId, threadId), {
+          baseLoading: false,
+          toolHistoryLoading: false
+        });
         set({ globalError: toErrorMessage(error) });
       }
     },
@@ -1741,48 +2739,39 @@ export const useAppStore = create<AppStore>((set, get) => {
       }
 
       const started = await startThread(device, cwd);
-      const payload = await readThread(device, started.threadId);
-      const model = payload.model ?? started.model;
+      const sessionKey = makeSessionKey(deviceId, started.threadId);
 
       set((state) => ({
-        sessions: mergeSessions(state.sessions, [payload.session]),
-        selectedSessionKey: payload.session.key,
-        modelBySession: model
+        selectedSessionKey: sessionKey,
+        composerPrefsBySession: upsertComposerPreference(
+          state.composerPrefsBySession,
+          sessionKey,
+          started.model,
+          undefined
+        ),
+        modelBySession: started.model
           ? {
               ...state.modelBySession,
-              [payload.session.key]: model
+              [sessionKey]: started.model
             }
           : state.modelBySession,
-        costUsdBySession: model
+        costUsdBySession: started.model
           ? {
               ...state.costUsdBySession,
-              [payload.session.key]: computeSessionCostUsd(
-                model,
-                state.tokenUsageBySession[payload.session.key]
+              [sessionKey]: computeSessionCostUsd(
+                started.model,
+                state.tokenUsageBySession[sessionKey]
               )
             }
           : state.costUsdBySession,
-        messagesBySession: {
-          ...state.messagesBySession,
-          [payload.session.key]: mergeThreadMessages(
-            state.messagesBySession[payload.session.key] ?? [],
-            payload.messages
-          )
-        },
-        composerPrefsBySession: upsertComposerPreference(
-          state.composerPrefsBySession,
-          payload.session.key,
-          undefined,
-          undefined
-        ),
         globalError: null
       }));
 
-      const indexedMessages =
-        get().messagesBySession[payload.session.key] ?? payload.messages;
-      upsertThreadIntoSearchIndex(payload.session, indexedMessages);
+      await get().refreshThread(deviceId, started.threadId, {
+        hydrateRollout: true
+      });
 
-      return payload.session.key;
+      return sessionKey;
     },
     submitComposer: async (submissionInput) => {
       const state = get();
@@ -1849,6 +2838,7 @@ export const useAppStore = create<AppStore>((set, get) => {
         deviceId: session.deviceId,
         threadId
       });
+      activeSendSessionKeys.add(session.key);
 
       void (async () => {
         try {
@@ -1887,6 +2877,10 @@ export const useAppStore = create<AppStore>((set, get) => {
         } catch (error) {
           stopPostSendRefresh(session.key);
           set({ globalError: toErrorMessage(error) });
+        } finally {
+          activeSendSessionKeys.delete(session.key);
+          flushQueuedSearchIndexPayloads();
+          startBackgroundSearchHydration();
         }
       })();
     },
@@ -1969,14 +2963,21 @@ export const useAppStore = create<AppStore>((set, get) => {
         clearAppliedCostEventKeysForDevice(deviceId);
         clearUsageBackfillStateForDevice(deviceId);
         clearQueuedSearchHydrationForDevice(deviceId);
+        clearQueuedSearchIndexPayloadsForDevice(deviceId);
         clearHydratedSearchSessionsForDevice(deviceId);
         rejectPendingSearchHydrationWorkerRequestsForDevice(deviceId);
         closeSearchHydrationWorkerDevice(deviceId);
+        closeThreadReadWorkerDevice(deviceId);
         syncSearchHydrationProgress();
         const disconnected = await disconnectDevice(deviceId);
         closeDeviceClient(deviceId);
         set((state) => ({
-          devices: upsertDevice(state.devices, disconnected)
+          devices: upsertDevice(state.devices, disconnected),
+          threadHydrationBySession: Object.fromEntries(
+            Object.entries(state.threadHydrationBySession).filter(
+              ([key]) => !key.startsWith(`${deviceId}::`)
+            )
+          )
         }));
       } catch (error) {
         set({ globalError: toErrorMessage(error) });
@@ -1993,8 +2994,10 @@ export const useAppStore = create<AppStore>((set, get) => {
         clearAppliedCostEventKeysForDevice(deviceId);
         clearUsageBackfillStateForDevice(deviceId);
         clearQueuedSearchHydrationForDevice(deviceId);
+        clearQueuedSearchIndexPayloadsForDevice(deviceId);
         rejectPendingSearchHydrationWorkerRequestsForDevice(deviceId);
         closeSearchHydrationWorkerDevice(deviceId);
+        closeThreadReadWorkerDevice(deviceId);
         const devices = await removeDevice(deviceId);
         clearHydratedSearchSessionsForDevice(deviceId);
         syncSearchHydrationProgress();
@@ -2011,6 +3014,11 @@ export const useAppStore = create<AppStore>((set, get) => {
           );
           const modelBySession = Object.fromEntries(
             Object.entries(state.modelBySession).filter(
+              ([key]) => !key.startsWith(`${deviceId}::`)
+            )
+          );
+          const threadHydrationBySession = Object.fromEntries(
+            Object.entries(state.threadHydrationBySession).filter(
               ([key]) => !key.startsWith(`${deviceId}::`)
             )
           );
@@ -2046,6 +3054,7 @@ export const useAppStore = create<AppStore>((set, get) => {
             devices,
             sessions,
             messagesBySession,
+            threadHydrationBySession,
             modelBySession,
             tokenUsageBySession,
             costUsdBySession,
@@ -2142,6 +3151,9 @@ export const useAppStore = create<AppStore>((set, get) => {
         searchResults: [],
         searchTotalHits: 0,
         searchLoading: false,
+        searchHydrating: false,
+        searchHydratedCount: 0,
+        searchHydrationTotal: 0,
         searchError: null
       });
     },
@@ -2152,7 +3164,7 @@ export const useAppStore = create<AppStore>((set, get) => {
 });
 
 export const shutdownRpcClients = (): void => {
-  shutdownSearchHydrationWorkerCallback?.();
+  shutdownWorkersCallback?.();
   setNotificationSink(null);
   closeAllClients();
 };
@@ -2160,6 +3172,9 @@ export const shutdownRpcClients = (): void => {
 export const __TEST_ONLY__ = {
   upsertMessage,
   mergeThreadMessages,
+  mergeSnapshotMessages,
+  mergeRolloutEnrichmentMessages,
+  normalizeLiveNotificationMessage,
   hasAcknowledgedEquivalent,
   toComposerPreference,
   upsertComposerPreference,

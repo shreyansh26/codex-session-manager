@@ -8,6 +8,11 @@ export interface ModelCatalogEntry {
 
 const MODEL_CATALOG_ENTRIES: ModelCatalogEntry[] = [
   {
+    id: "gpt-5.4",
+    label: "GPT-5.4",
+    thinkingEfforts: ["low", "medium", "high", "xhigh"]
+  },
+  {
     id: "gpt-5.3-codex",
     label: "GPT-5.3-Codex",
     thinkingEfforts: ["low", "medium", "high", "xhigh"]
@@ -47,16 +52,18 @@ const THINKING_EFFORT_LABELS: Record<ThinkingEffort, string> = {
 };
 
 const MODEL_DEFAULT_THINKING_EFFORT: Partial<Record<string, ThinkingEffort>> = {
+  "gpt-5.4": "xhigh",
   "gpt-5.3-codex": "xhigh"
 };
 
 export const MODEL_CATALOG: readonly ModelCatalogEntry[] = MODEL_CATALOG_ENTRIES;
 
-export const DEFAULT_COMPOSER_MODEL_ID = MODEL_CATALOG_ENTRIES[0].id;
+export const DEFAULT_COMPOSER_MODEL_ID = "gpt-5.3-codex";
 
 const DATE_SUFFIX_PATTERN = /-\d{4}-\d{2}-\d{2}$/;
 
 const MODEL_ID_ALIASES: Record<string, string> = {
+  "gpt-5.4-latest": "gpt-5.4",
   "gpt-5.3-codex-latest": "gpt-5.3-codex",
   "gpt-5-codex-latest": "gpt-5.3-codex",
   "gpt-5-codex": "gpt-5.3-codex",

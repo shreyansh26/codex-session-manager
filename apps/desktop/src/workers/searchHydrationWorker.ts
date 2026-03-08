@@ -19,7 +19,9 @@ const hydrateSession = async (
 ): Promise<void> => {
   const { device, requestId, session } = request;
   try {
-    const payload = await readThread(device, session.threadId);
+    const payload = await readThread(device, session.threadId, {
+      includeRolloutMessages: false
+    });
     postWorkerMessage({
       type: "hydrated-session",
       requestId,

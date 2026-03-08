@@ -1,6 +1,15 @@
 export type DeviceKind = "local" | "ssh";
 export type ChatRole = "user" | "assistant" | "system" | "tool";
 export type ThinkingEffort = "low" | "medium" | "high" | "xhigh";
+export type ChatMessageEventType = "reasoning" | "activity" | "tool_call";
+export type ChatToolCallStatus = "running" | "completed" | "failed";
+
+export interface ChatToolCall {
+  name: string;
+  input?: string;
+  output?: string;
+  status?: ChatToolCallStatus;
+}
 
 export interface DeviceConnection {
   endpoint: string;
@@ -55,7 +64,7 @@ export interface SessionSummary {
 }
 
 export interface ChatMessage {
-  eventType?: "reasoning" | "activity";
+  eventType?: ChatMessageEventType;
   id: string;
   key: string;
   threadId: string;
@@ -63,7 +72,9 @@ export interface ChatMessage {
   role: ChatRole;
   content: string;
   createdAt: string;
+  timelineOrder?: number;
   images?: ChatImageAttachment[];
+  toolCall?: ChatToolCall;
 }
 
 export interface TokenUsageBreakdown {
@@ -117,6 +128,23 @@ export interface ThreadPayload {
   session: SessionSummary;
   messages: ChatMessage[];
   model?: string;
+  rolloutPath?: string;
+}
+
+export interface ThreadRolloutPayload {
+  sessionKey: string;
+  threadId: string;
+  deviceId: string;
+  messages: ChatMessage[];
+  revision?: string;
+  rolloutPath?: string;
+}
+
+export interface ThreadHydrationState {
+  baseLoading: boolean;
+  baseLoaded: boolean;
+  toolHistoryLoading: boolean;
+  toolHistoryRevision?: string;
 }
 
 export interface DirectoryEntry {

@@ -19,6 +19,12 @@ describe("resolveModelPricing", () => {
       outputUsdPer1M: 10
     });
 
+    expect(resolveModelPricing("gpt-5.4")).toEqual({
+      inputUsdPer1M: 2.5,
+      cachedInputUsdPer1M: 0.25,
+      outputUsdPer1M: 15
+    });
+
     expect(resolveModelPricing("gpt-5-chat-latest")).toEqual({
       inputUsdPer1M: 1.25,
       cachedInputUsdPer1M: 0.125,
@@ -35,6 +41,18 @@ describe("resolveModelPricing", () => {
       inputUsdPer1M: 1.75,
       cachedInputUsdPer1M: 0.175,
       outputUsdPer1M: 14
+    });
+
+    expect(resolveModelPricing("gpt-5.3-codex-spark-latest")).toEqual({
+      inputUsdPer1M: 1.75,
+      cachedInputUsdPer1M: 0.175,
+      outputUsdPer1M: 14
+    });
+
+    expect(resolveModelPricing("gpt-5.1-codex-mini")).toEqual({
+      inputUsdPer1M: 0.25,
+      cachedInputUsdPer1M: 0.025,
+      outputUsdPer1M: 2
     });
   });
 

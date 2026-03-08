@@ -21,10 +21,16 @@ describe("modelCatalog normalization", () => {
     expect(normalizeCatalogModelId("openai/gpt-5.3-codex-latest")).toBe(
       "gpt-5.3-codex"
     );
+    expect(normalizeCatalogModelId("openai/gpt-5.4-latest")).toBe("gpt-5.4");
+    expect(resolveSupportedModelId("gpt-5.4")).toBe("gpt-5.4");
   });
 });
 
 describe("modelCatalog effort defaults", () => {
+  it("defaults gpt-5.4 to xhigh effort", () => {
+    expect(resolveThinkingEffortForModel("gpt-5.4", undefined)).toBe("xhigh");
+  });
+
   it("defaults gpt-5.3-codex to xhigh effort", () => {
     expect(resolveThinkingEffortForModel("gpt-5.3-codex", undefined)).toBe("xhigh");
   });
