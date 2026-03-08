@@ -734,12 +734,63 @@ const inferMimeTypeFromDataUrl = (value: string): string | null => {
   return match?.[1]?.toLowerCase() ?? null;
 };
 
+const extractWebSearchToolCall = (
+  item: Record<string, unknown>
+): ChatMessage["toolCall"] | undefined => {
+  const typeHint = (pickString(item, ["type", "itemType", "kind"]) ?? "").toLowerCase();
+  if (typeHint !== "web_search_call") {
+    return undefined;
+  }
+
+  const input = formatWebSearchActionInput(item.action);
+  const status = inferToolCallStatus(item, "web_search_call", null) ?? "completed";
+
+  return {
+    name: "web_search",
+    ...(input ? { input } : {}),
+    status
+  };
+};
+
+const formatWebSearchActionInput = (value: unknown): string | undefined => {
+  const record = asRecord(value);
+  if (!record) {
+    return undefined;
+  }
+
+  const type = pickString(record, ["type"]) ?? "search";
+  const query = pickString(record, ["query"]);
+  const url = pickString(record, ["url"]);
+  const pattern = pickString(record, ["pattern"]);
+  const queries = Array.isArray(record.queries)
+    ? record.queries
+        .filter((entry): entry is string => typeof entry === "string")
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0)
+    : [];
+
+  return (
+    stringifyJson({
+      type,
+      ...(query ? { query } : {}),
+      ...(url ? { url } : {}),
+      ...(pattern ? { pattern } : {}),
+      ...(queries.length > 0 ? { queries } : {})
+    }) ?? undefined
+  );
+};
+
 const extractStructuredToolCall = (
   item: Record<string, unknown>,
   method: string,
   role: ChatRole,
   content: string
 ): ChatMessage["toolCall"] | undefined => {
+  const webSearchToolCall = extractWebSearchToolCall(item);
+  if (webSearchToolCall) {
+    return webSearchToolCall;
+  }
+
   const methodLower = method.toLowerCase();
   const explicitName = pickToolName(item, methodLower, role, false);
   const input = extractToolInput(item);

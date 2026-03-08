@@ -338,6 +338,46 @@ const shouldPreserveEarliestUserTimestamp = (
   !current.toolCall &&
   !incoming.toolCall;
 
+const isCompactedRolloutHistoryMessage = (message: ChatMessage): boolean =>
+  message.eventType !== "tool_call" && message.id.startsWith("message-");
+
+const isRestampedHistoryTwinCandidate = (
+  current: ChatMessage,
+  incoming: ChatMessage
+): boolean => {
+  if (isOptimisticMessage(current) || isOptimisticMessage(incoming)) {
+    return false;
+  }
+
+  if (
+    current.role !== incoming.role ||
+    (current.eventType ?? "") !== (incoming.eventType ?? "")
+  ) {
+    return false;
+  }
+
+  if (current.eventType === "tool_call" || incoming.eventType === "tool_call") {
+    return false;
+  }
+
+  if (current.id === incoming.id) {
+    return false;
+  }
+
+  const sameContent =
+    normalizeMessageText(current.content) === normalizeMessageText(incoming.content);
+  const sameImages = imageSignature(current) === imageSignature(incoming);
+  const sameToolCall = toolCallSignature(current) === toolCallSignature(incoming);
+  if (!sameContent || !sameImages || !sameToolCall) {
+    return false;
+  }
+
+  return (
+    isCompactedRolloutHistoryMessage(current) !==
+    isCompactedRolloutHistoryMessage(incoming)
+  );
+};
+
 const mergeToolCalls = (
   current: ChatMessage["toolCall"],
   incoming: ChatMessage["toolCall"]
@@ -399,6 +439,77 @@ const preferLongerField = (
     return current;
   }
   return incoming.length >= current.length ? incoming : current;
+};
+
+const buildServerChatOrdinalLookup = (
+  messages: ChatMessage[]
+): Map<ChatMessage, number> => {
+  const ordered = [...messages].sort(sortMessagesAscending);
+  const lookup = new Map<ChatMessage, number>();
+  let ordinal = 0;
+  for (const message of ordered) {
+    if (message.eventType === "tool_call" || isOptimisticMessage(message)) {
+      continue;
+    }
+    lookup.set(message, ordinal);
+    ordinal += 1;
+  }
+  return lookup;
+};
+
+const findRestampedHistoryTwin = (
+  existing: ChatMessage[],
+  incoming: ChatMessage,
+  incomingChatOrdinal: number | undefined
+): ChatMessage | undefined => {
+  if (typeof incomingChatOrdinal !== "number") {
+    return undefined;
+  }
+
+  const orderedExisting = [...existing].sort(sortMessagesAscending);
+  const existingChatOrdinals = buildServerChatOrdinalLookup(orderedExisting);
+  const candidates = orderedExisting.filter((entry) =>
+    isRestampedHistoryTwinCandidate(entry, incoming)
+  );
+  if (candidates.length === 0) {
+    return undefined;
+  }
+
+  const sameOrdinal = candidates.find(
+    (entry) => existingChatOrdinals.get(entry) === incomingChatOrdinal
+  );
+  if (sameOrdinal) {
+    return sameOrdinal;
+  }
+
+  return candidates.length === 1 ? candidates[0] : undefined;
+};
+
+const mergeRestampedHistoryTwin = (
+  current: ChatMessage,
+  incoming: ChatMessage
+): ChatMessage => {
+  const merged = mergeStoredMessage(current, incoming);
+  const preserveTimestampFrom =
+    isCompactedRolloutHistoryMessage(current) && !isCompactedRolloutHistoryMessage(incoming)
+      ? current
+      : !isCompactedRolloutHistoryMessage(current) &&
+          isCompactedRolloutHistoryMessage(incoming)
+        ? incoming
+        : merged;
+  const preserveIdFrom =
+    isCompactedRolloutHistoryMessage(current) && !isCompactedRolloutHistoryMessage(incoming)
+      ? incoming
+      : !isCompactedRolloutHistoryMessage(current) &&
+          isCompactedRolloutHistoryMessage(incoming)
+        ? current
+        : merged;
+
+  return {
+    ...merged,
+    id: preserveIdFrom.id,
+    createdAt: preserveTimestampFrom.createdAt
+  };
 };
 
 const isLikelyOptimisticAcknowledgement = (
@@ -832,13 +943,24 @@ const mergeThreadMessages = (
 const mergeSnapshotMessagesIntoExisting = (
   existing: ChatMessage[],
   snapshotMessages: ChatMessage[]
-): ChatMessage[] =>
-  snapshotMessages.map((message) => {
+): ChatMessage[] => {
+  const snapshotChatOrdinals = buildServerChatOrdinalLookup(snapshotMessages);
+
+  return snapshotMessages.map((message) => {
     const exact = existing.find(
       (entry) => messageIdentityKey(entry) === messageIdentityKey(message)
     );
     if (exact) {
       return mergeStoredMessage(exact, message);
+    }
+
+    const historyTwin = findRestampedHistoryTwin(
+      existing,
+      message,
+      snapshotChatOrdinals.get(message)
+    );
+    if (historyTwin) {
+      return mergeRestampedHistoryTwin(historyTwin, message);
     }
 
     const logicalMatch = existing.find(
@@ -851,6 +973,7 @@ const mergeSnapshotMessagesIntoExisting = (
 
     return message;
   });
+};
 
 const mergeSnapshotMessages = (
   existing: ChatMessage[],
@@ -882,16 +1005,33 @@ const mergeRolloutEnrichmentMessages = (
   existing: ChatMessage[],
   enrichment: ChatMessage[]
 ): ChatMessage[] => {
+  const normalizedExisting = dedupeMessagesByIdentity(existing);
   const mergedByIdentity = new Map<string, ChatMessage>();
-  for (const message of dedupeMessagesByIdentity(existing)) {
+  for (const message of normalizedExisting) {
     mergedByIdentity.set(messageIdentityKey(message), message);
   }
 
-  for (const message of normalizeSnapshotMessages(enrichment)) {
+  const normalizedEnrichment = normalizeSnapshotMessages(enrichment);
+  const enrichmentChatOrdinals = buildServerChatOrdinalLookup(normalizedEnrichment);
+
+  for (const message of normalizedEnrichment) {
     const identity = messageIdentityKey(message);
     const exact = mergedByIdentity.get(identity);
     if (exact) {
       mergedByIdentity.set(identity, mergeStoredMessage(exact, message));
+      continue;
+    }
+
+    const historyTwin = findRestampedHistoryTwin(
+      [...mergedByIdentity.values()],
+      message,
+      enrichmentChatOrdinals.get(message)
+    );
+    if (historyTwin) {
+      mergedByIdentity.set(
+        messageIdentityKey(historyTwin),
+        mergeRestampedHistoryTwin(historyTwin, message)
+      );
       continue;
     }
 
@@ -2153,9 +2293,16 @@ export const useAppStore = create<AppStore>((set, get) => {
     nextThreadBaseLoadToken += 1;
     latestThreadBaseRequestIdBySession.set(sessionKey, requestToken);
     activeThreadBaseLoads.add(sessionKey);
+    const existingMessages = get().messagesBySession[sessionKey] ?? [];
+    const currentHydrationState =
+      get().threadHydrationBySession[sessionKey] ?? DEFAULT_THREAD_HYDRATION_STATE;
+    const shouldShowBaseLoading =
+      !options?.skipMessages &&
+      existingMessages.length === 0 &&
+      !currentHydrationState.baseLoaded;
 
     setThreadHydrationFlags(sessionKey, {
-      baseLoading: true,
+      baseLoading: shouldShowBaseLoading,
       ...(options?.skipMessages
         ? {}
         : {

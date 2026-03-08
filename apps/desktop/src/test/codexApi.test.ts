@@ -8,7 +8,7 @@ import {
   parentPosixPath,
   parseLsDirectoryEntries
 } from "../services/codexApi";
-import type { ChatImageAttachment, ComposerSubmission } from "../domain/types";
+import type { ChatImageAttachment, ChatMessage, ComposerSubmission } from "../domain/types";
 
 const sampleImage = (url: string): ChatImageAttachment => ({
   id: "img-1",
@@ -241,6 +241,46 @@ describe("parseToolMessagesFromRolloutJsonl", () => {
       }
     });
   });
+
+  it("parses web_search_call rollout records into tool messages", () => {
+    const jsonl = [
+      JSON.stringify({
+        timestamp: "2026-03-08T10:15:55.487Z",
+        type: "response_item",
+        payload: {
+          type: "web_search_call",
+          status: "completed",
+          action: {
+            type: "search",
+            query: "site:investing.com Reuters March 8 2026 Gulf attacks Iran war",
+            queries: [
+              "site:investing.com Reuters March 8 2026 Gulf attacks Iran war",
+              "site:investing.com Reuters March 8 2026 oil prices Hormuz Iran war"
+            ]
+          }
+        }
+      })
+    ].join("\n");
+
+    const messages = parseToolMessagesFromRolloutJsonl(
+      "device-1",
+      "thread-1",
+      jsonl
+    );
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      role: "tool",
+      eventType: "tool_call",
+      toolCall: {
+        name: "web_search",
+        status: "completed"
+      }
+    });
+    expect(messages[0].toolCall?.input).toContain(
+      '"query": "site:investing.com Reuters March 8 2026 Gulf attacks Iran war"'
+    );
+  });
 });
 
 describe("parseMessagesFromThread", () => {
@@ -278,5 +318,61 @@ describe("parseMessagesFromThread", () => {
       "assistant:assistant-2"
     ]);
     expect(messages.map((message) => message.timelineOrder)).toEqual([0, 1, 2, 3]);
+  });
+
+  it("ignores rollout response_item user scaffolding while preserving visible user and assistant timeline messages", () => {
+    const messages = [
+      {
+        kind: "message",
+        id: "wrapper",
+        role: "user",
+        content:
+          "# AGENTS.md instructions for /Users/shreyansh/Projects/misc\n\n<environment_context>...</environment_context>",
+        createdAt: "2026-03-08T09:58:46.626Z",
+        order: 0,
+        sourceType: "response_item"
+      },
+      {
+        kind: "message",
+        id: "prompt",
+        role: "user",
+        content: "What are the top news from today from the Iran-Israel war?",
+        createdAt: "2026-03-08T09:58:46.626Z",
+        order: 1,
+        sourceType: "event_msg"
+      },
+      {
+        kind: "message",
+        id: "assistant",
+        role: "assistant",
+        content: "Here are the latest developments I found.",
+        createdAt: "2026-03-08T10:00:47.879Z",
+        order: 2,
+        sourceType: "response_item"
+      },
+      {
+        kind: "message",
+        id: "reasoning",
+        role: "assistant",
+        content: "Searching Reuters and AP.",
+        createdAt: "2026-03-08T09:58:52.344Z",
+        order: 3,
+        eventType: "reasoning",
+        sourceType: "response_item"
+      }
+    ]
+      .map((record) =>
+        codexApiTest.toTimelineMessageFromRolloutRecord("device-1", "thread-1", record)
+      )
+      .filter((message): message is ChatMessage => message !== null);
+
+    expect(messages.map((message) => `${message.role}:${message.id}`)).toEqual([
+      "user:prompt",
+      "assistant:assistant",
+      "assistant:reasoning"
+    ]);
+    expect(messages.find((message) => message.id === "reasoning")?.eventType).toBe(
+      "reasoning"
+    );
   });
 });

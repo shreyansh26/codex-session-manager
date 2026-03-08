@@ -761,6 +761,200 @@ describe("frontend transcript emulation", () => {
     ]);
   });
 
+  it("does not surface rollout scaffold messages as fake older history in a new chat", () => {
+    const prompt = "What are the top news from today from the Iran-Israel war?";
+    const optimistic: ChatMessage = {
+      id: "local-prompt",
+      key: "device-1::thread-real",
+      threadId: "thread-real",
+      deviceId: "device-1",
+      role: "user",
+      content: prompt,
+      createdAt: "2026-03-08T09:58:46.900Z"
+    };
+
+    const rolloutMessages = [
+      {
+        kind: "message",
+        id: "wrapper",
+        role: "user",
+        content:
+          "# AGENTS.md instructions for /Users/shreyansh/Projects/misc\n\n<environment_context>...</environment_context>",
+        createdAt: "2026-03-08T09:58:46.626Z",
+        order: 0,
+        sourceType: "response_item"
+      },
+      {
+        kind: "message",
+        id: "prompt",
+        role: "user",
+        content: prompt,
+        createdAt: "2026-03-08T09:58:46.626Z",
+        order: 1,
+        sourceType: "event_msg"
+      }
+    ]
+      .map((record) =>
+        codexApiTest.toTimelineMessageFromRolloutRecord("device-1", "thread-real", record)
+      )
+      .filter((message): message is ChatMessage => message !== null);
+
+    const merged = __TEST_ONLY__.mergeRolloutEnrichmentMessages([optimistic], rolloutMessages);
+    expect(merged.map((message) => `${message.role}:${message.content}`)).toEqual([
+      `user:${prompt}`
+    ]);
+
+    const window = resolveVisibleMessageWindow({
+      messages: merged,
+      visibleMessageCount: 40,
+      anchorMessageKey: "local-prompt::user::"
+    });
+    expect(window.hiddenMessageCount).toBe(0);
+    expect(window.visibleMessages).toHaveLength(1);
+  });
+
+  it("keeps rollout tools interleaved with snapshot chat messages after a stale thread/read refresh", () => {
+    const snapshotMessages: ChatMessage[] = [
+      {
+        id: "item-1",
+        key: "device-1::thread-real",
+        threadId: "thread-real",
+        deviceId: "device-1",
+        role: "user",
+        content: "I want all prime numbers from 1 - 100. Write a python script for that",
+        createdAt: "2026-03-08T10:34:48.000Z",
+        timelineOrder: 0
+      },
+      {
+        id: "item-2",
+        key: "device-1::thread-real",
+        threadId: "thread-real",
+        deviceId: "device-1",
+        role: "assistant",
+        content:
+          "I’m checking the workspace layout first, then I’ll add a small Python script that prints all primes from 1 to 100 and verify it runs.",
+        createdAt: "2026-03-08T10:34:48.000Z",
+        timelineOrder: 1
+      },
+      {
+        id: "item-3",
+        key: "device-1::thread-real",
+        threadId: "thread-real",
+        deviceId: "device-1",
+        role: "assistant",
+        content:
+          "The workspace is minimal, so I’m adding a standalone script at the repo root rather than modifying existing files. After that I’ll run it once to confirm the output.",
+        createdAt: "2026-03-08T10:34:48.000Z",
+        timelineOrder: 2
+      },
+      {
+        id: "item-4",
+        key: "device-1::thread-real",
+        threadId: "thread-real",
+        deviceId: "device-1",
+        role: "assistant",
+        content:
+          "Created `primes_1_to_100.py`. It prints all prime numbers from 1 to 100.",
+        createdAt: "2026-03-08T10:34:48.000Z",
+        timelineOrder: 3
+      }
+    ];
+
+    const rolloutMessages: ChatMessage[] = [
+      {
+        id: "message-user",
+        key: "device-1::thread-real",
+        threadId: "thread-real",
+        deviceId: "device-1",
+        role: "user",
+        content: "I want all prime numbers from 1 - 100. Write a python script for that",
+        createdAt: "2026-03-08T10:34:26.740Z",
+        timelineOrder: 0
+      },
+      {
+        id: "message-assistant-1",
+        key: "device-1::thread-real",
+        threadId: "thread-real",
+        deviceId: "device-1",
+        role: "assistant",
+        content:
+          "I’m checking the workspace layout first, then I’ll add a small Python script that prints all primes from 1 to 100 and verify it runs.",
+        createdAt: "2026-03-08T10:34:36.247Z",
+        timelineOrder: 1
+      },
+      {
+        id: "call-apply-patch",
+        key: "device-1::thread-real",
+        threadId: "thread-real",
+        deviceId: "device-1",
+        role: "tool",
+        eventType: "tool_call",
+        content:
+          "Tool: apply_patch\n\nInput:\n*** Begin Patch\n*** Add File: primes_1_to_100.py",
+        createdAt: "2026-03-08T10:34:37.920Z",
+        timelineOrder: 2,
+        toolCall: {
+          name: "apply_patch",
+          input: "*** Begin Patch\n*** Add File: primes_1_to_100.py",
+          status: "completed"
+        }
+      },
+      {
+        id: "message-assistant-2",
+        key: "device-1::thread-real",
+        threadId: "thread-real",
+        deviceId: "device-1",
+        role: "assistant",
+        content:
+          "The workspace is minimal, so I’m adding a standalone script at the repo root rather than modifying existing files. After that I’ll run it once to confirm the output.",
+        createdAt: "2026-03-08T10:34:41.920Z",
+        timelineOrder: 3
+      },
+      {
+        id: "call-exec-command",
+        key: "device-1::thread-real",
+        threadId: "thread-real",
+        deviceId: "device-1",
+        role: "tool",
+        eventType: "tool_call",
+        content: "Tool: exec_command\n\nInput:\npython3 /Users/shreyansh/Projects/misc/primes_1_to_100.py",
+        createdAt: "2026-03-08T10:34:42.515Z",
+        timelineOrder: 4,
+        toolCall: {
+          name: "exec_command",
+          input: "python3 /Users/shreyansh/Projects/misc/primes_1_to_100.py",
+          output:
+            "[2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97]",
+          status: "completed"
+        }
+      },
+      {
+        id: "message-assistant-3",
+        key: "device-1::thread-real",
+        threadId: "thread-real",
+        deviceId: "device-1",
+        role: "assistant",
+        content:
+          "Created `primes_1_to_100.py`. It prints all prime numbers from 1 to 100.",
+        createdAt: "2026-03-08T10:34:48.130Z",
+        timelineOrder: 5
+      }
+    ];
+
+    const base = __TEST_ONLY__.mergeSnapshotMessages([], snapshotMessages);
+    const enriched = __TEST_ONLY__.mergeRolloutEnrichmentMessages(base, rolloutMessages);
+    const refreshed = __TEST_ONLY__.mergeSnapshotMessages(enriched, snapshotMessages);
+
+    expect(refreshed.map((message) => [message.id, message.role, message.createdAt])).toEqual([
+      ["item-1", "user", "2026-03-08T10:34:26.740Z"],
+      ["item-2", "assistant", "2026-03-08T10:34:36.247Z"],
+      ["call-apply-patch", "tool", "2026-03-08T10:34:37.920Z"],
+      ["item-3", "assistant", "2026-03-08T10:34:41.920Z"],
+      ["call-exec-command", "tool", "2026-03-08T10:34:42.515Z"],
+      ["item-4", "assistant", "2026-03-08T10:34:48.130Z"]
+    ]);
+  });
+
   it("keeps load-older expansion working in the same emulated transcript path", () => {
     const messages: ChatMessage[] = Array.from({ length: 45 }, (_, index) => ({
       id: `assistant-${index + 1}`,

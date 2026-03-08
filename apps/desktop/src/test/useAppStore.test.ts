@@ -527,6 +527,113 @@ describe("useAppStore message upsert behavior", () => {
     });
   });
 
+  it("merges restamped snapshot chat items back onto rollout twins so tools stay interleaved", () => {
+    const snapshotMessages = [
+      buildMessage({
+        id: "item-1",
+        role: "user",
+        content: "I want all prime numbers from 1 - 100. Write a python script for that",
+        createdAt: "2026-03-08T10:34:48.000Z",
+        timelineOrder: 0
+      }),
+      buildMessage({
+        id: "item-2",
+        role: "assistant",
+        content:
+          "I’m checking the workspace layout first, then I’ll add a small Python script that prints all primes from 1 to 100 and verify it runs.",
+        createdAt: "2026-03-08T10:34:48.000Z",
+        timelineOrder: 1
+      }),
+      buildMessage({
+        id: "item-3",
+        role: "assistant",
+        content:
+          "The workspace is minimal, so I’m adding a standalone script at the repo root rather than modifying existing files. After that I’ll run it once to confirm the output.",
+        createdAt: "2026-03-08T10:34:48.000Z",
+        timelineOrder: 2
+      }),
+      buildMessage({
+        id: "item-4",
+        role: "assistant",
+        content:
+          "Created `primes_1_to_100.py`. It prints all prime numbers from 1 to 100.",
+        createdAt: "2026-03-08T10:34:48.000Z",
+        timelineOrder: 3
+      })
+    ];
+
+    const enriched = __TEST_ONLY__.mergeRolloutEnrichmentMessages(snapshotMessages, [
+      buildMessage({
+        id: "message-user",
+        role: "user",
+        content: "I want all prime numbers from 1 - 100. Write a python script for that",
+        createdAt: "2026-03-08T10:34:26.740Z",
+        timelineOrder: 0
+      }),
+      buildMessage({
+        id: "message-assistant-1",
+        role: "assistant",
+        content:
+          "I’m checking the workspace layout first, then I’ll add a small Python script that prints all primes from 1 to 100 and verify it runs.",
+        createdAt: "2026-03-08T10:34:36.247Z",
+        timelineOrder: 1
+      }),
+      buildMessage({
+        id: "call-apply-patch",
+        role: "tool",
+        eventType: "tool_call",
+        content:
+          "Tool: apply_patch\n\nInput:\n*** Begin Patch\n*** Add File: primes_1_to_100.py",
+        createdAt: "2026-03-08T10:34:37.920Z",
+        timelineOrder: 2,
+        toolCall: {
+          name: "apply_patch",
+          input: "*** Begin Patch\n*** Add File: primes_1_to_100.py",
+          status: "completed"
+        }
+      }),
+      buildMessage({
+        id: "message-assistant-2",
+        role: "assistant",
+        content:
+          "The workspace is minimal, so I’m adding a standalone script at the repo root rather than modifying existing files. After that I’ll run it once to confirm the output.",
+        createdAt: "2026-03-08T10:34:41.920Z",
+        timelineOrder: 3
+      }),
+      buildMessage({
+        id: "call-exec-command",
+        role: "tool",
+        eventType: "tool_call",
+        content: "Tool: exec_command\n\nInput:\npython3 primes_1_to_100.py",
+        createdAt: "2026-03-08T10:34:42.515Z",
+        timelineOrder: 4,
+        toolCall: {
+          name: "exec_command",
+          input: "python3 primes_1_to_100.py",
+          output: "[2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97]",
+          status: "completed"
+        }
+      }),
+      buildMessage({
+        id: "message-assistant-3",
+        role: "assistant",
+        content:
+          "Created `primes_1_to_100.py`. It prints all prime numbers from 1 to 100.",
+        createdAt: "2026-03-08T10:34:48.130Z",
+        timelineOrder: 5
+      })
+    ]);
+
+    expect(enriched.map((message) => [message.id, message.role, message.createdAt])).toEqual([
+      ["item-1", "user", "2026-03-08T10:34:26.740Z"],
+      ["item-2", "assistant", "2026-03-08T10:34:36.247Z"],
+      ["call-apply-patch", "tool", "2026-03-08T10:34:37.920Z"],
+      ["item-3", "assistant", "2026-03-08T10:34:41.920Z"],
+      ["call-exec-command", "tool", "2026-03-08T10:34:42.515Z"],
+      ["item-4", "assistant", "2026-03-08T10:34:48.130Z"]
+    ]);
+  });
+
   it("keeps exact same snapshot item ids pinned to their first rendered timestamp across later thread/read refreshes", () => {
     const existing = [
       buildMessage({

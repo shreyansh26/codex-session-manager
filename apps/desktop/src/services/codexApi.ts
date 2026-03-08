@@ -784,6 +784,14 @@ const toHistoryMessageFromRolloutRecord = (
   if (!id || (role !== "user" && role !== "assistant" && role !== "system")) {
     return null;
   }
+  const sourceType = pickString(record, ["sourceType", "source_type"]);
+  // Rollout `response_item` user entries carry hidden prompt scaffolding
+  // (AGENTS/environment context, subagent notifications, etc.). Base
+  // `thread/read` history is authoritative for user messages, so rollout
+  // enrichment should only surface assistant-side `response_item` history.
+  if (sourceType === "response_item" && role !== "assistant") {
+    return null;
+  }
 
   const images = toImagesFromRolloutRecord(record);
   const eventType = pickString(record, ["eventType"]);
@@ -869,12 +877,16 @@ const upsertRolloutToolEntry = (
     effectiveType !== "function_call" &&
     effectiveType !== "function_call_output" &&
     effectiveType !== "custom_tool_call" &&
-    effectiveType !== "custom_tool_call_output"
+    effectiveType !== "custom_tool_call_output" &&
+    effectiveType !== "web_search_call"
   ) {
     return;
   }
 
-  const callId = pickString(payload, ["call_id", "callId"]);
+  const callId =
+    effectiveType === "web_search_call"
+      ? buildRolloutWebSearchEntryId(payload, timestamp)
+      : pickString(payload, ["call_id", "callId"]);
   if (!callId) {
     return;
   }
@@ -886,6 +898,21 @@ const upsertRolloutToolEntry = (
     createdAt: timestamp,
     updatedAt: timestamp
   };
+
+  if (effectiveType === "web_search_call") {
+    const input = formatRolloutWebSearchAction(asRecord(payload.action));
+    const status = normalizeToolStatus(pickString(payload, ["status"])) ?? "completed";
+
+    entries.set(callId, {
+      ...entry,
+      name: "web_search",
+      ...(input ? { input } : {}),
+      status,
+      createdAt: existing?.createdAt ?? timestamp,
+      updatedAt: timestamp
+    });
+    return;
+  }
 
   if (effectiveType === "function_call" || effectiveType === "custom_tool_call") {
     const name = pickString(payload, ["name"]);
@@ -924,6 +951,62 @@ const upsertRolloutToolEntry = (
     status,
     updatedAt: timestamp
   });
+};
+
+const buildRolloutWebSearchEntryId = (
+  payload: Record<string, unknown>,
+  timestamp: string
+): string | null => {
+  const action = asRecord(payload.action);
+  const fragment =
+    sanitizeRolloutToolIdFragment(
+      pickString(action, ["query", "url", "pattern"]) ??
+        pickString(action, ["type"]) ??
+        "search"
+    ) ?? "search";
+  return `web_search::${fragment}::${timestamp}`;
+};
+
+const sanitizeRolloutToolIdFragment = (value: string): string | null => {
+  const normalized = value
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9._/-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[-/]+|[-/]+$/g, "")
+    .slice(0, 80);
+  return normalized.length > 0 ? normalized : null;
+};
+
+const formatRolloutWebSearchAction = (
+  action: Record<string, unknown> | null
+): string | undefined => {
+  if (!action) {
+    return undefined;
+  }
+
+  const type = pickString(action, ["type"]) ?? "search";
+  const query = pickString(action, ["query"]);
+  const url = pickString(action, ["url"]);
+  const pattern = pickString(action, ["pattern"]);
+  const queries = ensureArray(action.queries)
+    .filter((entry): entry is string => typeof entry === "string")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+
+  const serialized = JSON.stringify(
+    {
+      type,
+      ...(query ? { query } : {}),
+      ...(url ? { url } : {}),
+      ...(pattern ? { pattern } : {}),
+      ...(queries.length > 0 ? { queries } : {})
+    },
+    null,
+    2
+  );
+
+  return serialized !== "{}" ? serialized : undefined;
 };
 
 const formatFunctionArguments = (value: string | null): string | undefined => {
@@ -1272,6 +1355,25 @@ const buildCompactRolloutPythonScript = (): string =>
     "    text = re.sub(r'\\n{3,}', '\\n\\n', text).strip()",
     "    return text if len(text) <= 4000 else text[:4000] + '\\n...[truncated]'",
     "",
+    "def fmt_search_action(action):",
+    "    if not isinstance(action, dict):",
+    "        return None",
+    "    result = {'type': action.get('type') or 'search'}",
+    "    if isinstance(action.get('query'), str) and action['query'].strip():",
+    "        result['query'] = action['query']",
+    "    if isinstance(action.get('url'), str) and action['url'].strip():",
+    "        result['url'] = action['url']",
+    "    if isinstance(action.get('pattern'), str) and action['pattern'].strip():",
+    "        result['pattern'] = action['pattern']",
+    "    queries = [",
+    "        entry.strip()",
+    "        for entry in (action.get('queries') or [])",
+    "        if isinstance(entry, str) and entry.strip()",
+    "    ]",
+    "    if queries:",
+    "        result['queries'] = queries",
+    "    return json.dumps(result, indent=2) if result else None",
+    "",
     "def extract_text(value):",
     "    if isinstance(value, str):",
     "        return value",
@@ -1294,7 +1396,7 @@ const buildCompactRolloutPythonScript = (): string =>
     "        return 'file://' + text",
     "    return text",
     "",
-    "def add_message(timestamp, role, content, raw_images, event_type=None):",
+    "def add_message(timestamp, role, content, raw_images, event_type=None, source_type=None):",
     "    global order_counter",
     "    if role not in {'user', 'assistant'}:",
     "        return",
@@ -1326,6 +1428,8 @@ const buildCompactRolloutPythonScript = (): string =>
     "    order_counter += 1",
     "    if event_type:",
     "        entry['eventType'] = event_type",
+    "    if source_type:",
+    "        entry['sourceType'] = source_type",
     "    if normalized_images:",
     "        entry['images'] = [",
     "            {'id': f'image-{index + 1}', 'url': image_url}",
@@ -1348,15 +1452,21 @@ const buildCompactRolloutPythonScript = (): string =>
     "                obj.get('timestamp'),",
     "                'user' if payload_type == 'user_message' else 'assistant',",
     "                payload.get('message'),",
-    "                (payload.get('images') or []) + (payload.get('local_images') or [])",
+    "                (payload.get('images') or []) + (payload.get('local_images') or []),",
+    "                None,",
+    "                'event_msg'",
     "            )",
     "            continue",
     "        if obj.get('type') == 'response_item' and payload_type == 'message':",
+    "            if payload.get('role') != 'assistant':",
+    "                continue",
     "            add_message(",
     "                obj.get('timestamp'),",
     "                payload.get('role'),",
     "                extract_text(payload.get('content')),",
-    "                []",
+    "                [],",
+    "                None,",
+    "                'response_item'",
     "            )",
     "            continue",
     "        if obj.get('type') == 'response_item' and payload_type == 'reasoning':",
@@ -1367,8 +1477,29 @@ const buildCompactRolloutPythonScript = (): string =>
     "                    'assistant',",
     "                    reasoning_text,",
     "                    [],",
-    "                    'reasoning'",
+    "                    'reasoning',",
+    "                    'response_item'",
     "                )",
+    "            continue",
+    "        if payload_type == 'web_search_call':",
+    "            search_input = fmt_search_action(payload.get('action'))",
+    "            digest_source = json.dumps({",
+    "                'timestamp': obj.get('timestamp'),",
+    "                'action': payload.get('action')",
+    "            }, sort_keys=True, default=str)",
+    "            call_id = 'web_search-' + hashlib.sha1(digest_source.encode('utf-8')).hexdigest()[:16]",
+    "            tool_entries[call_id] = {",
+    "                'id': call_id,",
+    "                'kind': 'tool',",
+    "                'name': 'web_search',",
+    "                'createdAt': obj.get('timestamp'),",
+    "                'updatedAt': obj.get('timestamp'),",
+    "                'order': order_counter,",
+    "                'status': payload.get('status') or 'completed'",
+    "            }",
+    "            if isinstance(search_input, str) and search_input:",
+    "                tool_entries[call_id]['input'] = search_input",
+    "            order_counter += 1",
     "            continue",
     "        if payload_type not in {'function_call', 'function_call_output', 'custom_tool_call', 'custom_tool_call_output'}:",
     "            continue",
@@ -2195,5 +2326,6 @@ const asErrorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : "Unknown error";
 
 export const __TEST_ONLY__ = {
-  parseMessagesFromThread
+  parseMessagesFromThread,
+  toTimelineMessageFromRolloutRecord
 };

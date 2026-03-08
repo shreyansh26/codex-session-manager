@@ -337,6 +337,47 @@ describe("parseRpcNotification", () => {
     });
   });
 
+  it("parses codex/event web_search_call payloads into tool messages", () => {
+    const parsed = parseRpcNotification("device-9", {
+      method: "codex/event",
+      params: {
+        threadId: "thread-live-tool",
+        msg: {
+          type: "response_item",
+          payload: {
+            type: "web_search_call",
+            status: "completed",
+            action: {
+              type: "search",
+              query: "Iran Israel war news March 8 2026 Reuters",
+              queries: [
+                "Iran Israel war news March 8 2026 Reuters",
+                "Iran Israel war today March 8 2026 AP News"
+              ]
+            }
+          }
+        }
+      }
+    });
+
+    expect(parsed).toMatchObject({
+      kind: "message",
+      threadId: "thread-live-tool",
+      message: {
+        key: "device-9::thread-live-tool",
+        role: "tool",
+        eventType: "tool_call",
+        toolCall: {
+          name: "web_search",
+          status: "completed"
+        }
+      }
+    });
+    expect(parsed?.message.toolCall?.input).toContain(
+      '"query": "Iran Israel war news March 8 2026 Reuters"'
+    );
+  });
+
   it("parses codex/event response_item envelopes when only conversationId is present on params", () => {
     const parsed = parseRpcNotification("device-9", {
       method: "codex/event",
