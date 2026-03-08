@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import type {
   DirectoryBrowseResult,
   DirectoryEntry,
@@ -101,7 +101,7 @@ const toErrorMessage = (error: unknown): string => {
   return "Operation failed.";
 };
 
-export default function Sidebar({
+function Sidebar({
   devices,
   sessions,
   selectedSessionKey,
@@ -159,6 +159,14 @@ export default function Sidebar({
 
     return grouped;
   }, [sessions]);
+
+  const folderGroupsByDevice = useMemo(() => {
+    const grouped = new Map<string, ReturnType<typeof groupSessionsByFolder>>();
+    for (const [deviceId, deviceSessions] of sessionsByDevice.entries()) {
+      grouped.set(deviceId, groupSessionsByFolder(deviceSessions));
+    }
+    return grouped;
+  }, [sessionsByDevice]);
 
   const loadDirectoryEntries = async (deviceId: string, cwd: string): Promise<void> => {
     setNewSessionLoadingByDevice((previous) => ({ ...previous, [deviceId]: true }));
@@ -278,7 +286,7 @@ export default function Sidebar({
         {devices.map((device) => {
           const status = toStatus(device);
           const deviceSessions = sessionsByDevice.get(device.id) ?? [];
-          const folderGroups = groupSessionsByFolder(deviceSessions);
+          const folderGroups = folderGroupsByDevice.get(device.id) ?? [];
           const isCollapsed = collapsedByDevice[device.id] ?? false;
           const isLocalDevice = device.config.kind === "local";
           const fallbackSessionPath = deviceSessions[0]?.cwd;
@@ -584,3 +592,5 @@ export default function Sidebar({
     </aside>
   );
 }
+
+export default memo(Sidebar);

@@ -86,11 +86,43 @@ describe("parseRpcNotification", () => {
       kind: "message",
       threadId: "thread-order",
       message: {
-        id: "reasoning-1",
+        id: "reasoning-1::2026-03-02T12:00:09.000Z",
         eventType: "reasoning",
         createdAt: "2026-03-02T12:00:09.000Z"
       }
     });
+  });
+
+  it("creates separate reasoning snapshot ids for repeated updates to the same item", () => {
+    const first = parseRpcNotification("device-9", {
+      method: "item/updated",
+      params: {
+        threadId: "thread-reasoning-snapshots",
+        item: {
+          id: "reasoning-live",
+          role: "system",
+          type: "reasoning",
+          content: "Looking for sources",
+          updatedAt: "2026-03-02T12:00:01.000Z"
+        }
+      }
+    });
+    const second = parseRpcNotification("device-9", {
+      method: "item/updated",
+      params: {
+        threadId: "thread-reasoning-snapshots",
+        item: {
+          id: "reasoning-live",
+          role: "system",
+          type: "reasoning",
+          content: "Looking for sources and narrowing to primary docs",
+          updatedAt: "2026-03-02T12:00:04.000Z"
+        }
+      }
+    });
+
+    expect(first?.message.id).toBe("reasoning-live::2026-03-02T12:00:01.000Z");
+    expect(second?.message.id).toBe("reasoning-live::2026-03-02T12:00:04.000Z");
   });
 
   it("extracts image attachments from message notifications", () => {
@@ -197,13 +229,21 @@ describe("parseRpcNotification", () => {
     expect(parsed).toBeNull();
   });
 
-  it("parses activity notifications into activity messages", () => {
+  it("parses tool notifications into structured tool call messages", () => {
     const parsed = parseRpcNotification("device-3", {
       method: "tool/exec",
       params: {
         threadId: "thread-900",
+        toolName: "exec_command",
         command: "rg --files",
-        cwd: "/tmp/project"
+        cwd: "/tmp/project",
+        output: {
+          chunkId: "978a4a",
+          wallTime: 0.4916,
+          exitCode: 0,
+          originalTokenCount: 11,
+          output: "0\n/tmp/clone.log\nCloning into 'llm.c'..."
+        }
       }
     });
 
@@ -215,7 +255,231 @@ describe("parseRpcNotification", () => {
         threadId: "thread-900",
         deviceId: "device-3",
         role: "tool",
-        eventType: "activity"
+        eventType: "tool_call",
+        toolCall: {
+          name: "exec_command",
+          input: "rg --files",
+          status: "completed"
+        }
+      }
+    });
+    expect(parsed?.message.toolCall?.output).toContain("Chunk ID: 978a4a");
+    expect(parsed?.message.toolCall?.output).toContain("Process exited with code 0");
+  });
+
+  it("parses codex/event wrapped function_call payloads into tool messages", () => {
+    const parsed = parseRpcNotification("device-9", {
+      method: "codex/event",
+      params: {
+        threadId: "thread-live-tool",
+        msg: {
+          type: "function_call",
+          name: "exec_command",
+          arguments: JSON.stringify({
+            cmd: "pwd",
+            workdir: "/tmp/demo"
+          }),
+          call_id: "call_live_tool"
+        }
+      }
+    });
+
+    expect(parsed).toMatchObject({
+      kind: "message",
+      threadId: "thread-live-tool",
+      message: {
+        id: "call_live_tool",
+        key: "device-9::thread-live-tool",
+        role: "tool",
+        eventType: "tool_call",
+        toolCall: {
+          name: "exec_command",
+          input: '{"cmd":"pwd","workdir":"/tmp/demo"}'
+        }
+      }
+    });
+  });
+
+  it("parses codex/event response_item envelopes using nested call ids", () => {
+    const parsed = parseRpcNotification("device-9", {
+      method: "codex/event",
+      params: {
+        threadId: "thread-live-tool",
+        id: "turn-envelope-1",
+        msg: {
+          type: "response_item",
+          payload: {
+            type: "function_call",
+            name: "write_stdin",
+            arguments: JSON.stringify({
+              session_id: 77083,
+              chars: "\u0003"
+            }),
+            call_id: "call_nested_live_tool"
+          }
+        }
+      }
+    });
+
+    expect(parsed).toMatchObject({
+      kind: "message",
+      threadId: "thread-live-tool",
+      message: {
+        id: "call_nested_live_tool",
+        key: "device-9::thread-live-tool",
+        role: "tool",
+        eventType: "tool_call",
+        toolCall: {
+          name: "write_stdin",
+          input: '{"session_id":77083,"chars":"\\u0003"}'
+        }
+      }
+    });
+  });
+
+  it("parses codex/event web_search_call payloads into tool messages", () => {
+    const parsed = parseRpcNotification("device-9", {
+      method: "codex/event",
+      params: {
+        threadId: "thread-live-tool",
+        msg: {
+          type: "response_item",
+          payload: {
+            type: "web_search_call",
+            status: "completed",
+            action: {
+              type: "search",
+              query: "Iran Israel war news March 8 2026 Reuters",
+              queries: [
+                "Iran Israel war news March 8 2026 Reuters",
+                "Iran Israel war today March 8 2026 AP News"
+              ]
+            }
+          }
+        }
+      }
+    });
+
+    expect(parsed).toMatchObject({
+      kind: "message",
+      threadId: "thread-live-tool",
+      message: {
+        key: "device-9::thread-live-tool",
+        role: "tool",
+        eventType: "tool_call",
+        toolCall: {
+          name: "web_search",
+          status: "completed"
+        }
+      }
+    });
+    expect(parsed?.message.toolCall?.input).toContain(
+      '"query": "Iran Israel war news March 8 2026 Reuters"'
+    );
+  });
+
+  it("parses codex/event response_item envelopes when only conversationId is present on params", () => {
+    const parsed = parseRpcNotification("device-9", {
+      method: "codex/event",
+      params: {
+        conversationId: "thread-live-tool",
+        id: "turn-envelope-2",
+        msg: {
+          type: "response_item",
+          payload: {
+            type: "function_call",
+            name: "exec_command",
+            arguments: JSON.stringify({
+              cmd: "pwd"
+            }),
+            call_id: "call_conversation_live_tool"
+          }
+        }
+      }
+    });
+
+    expect(parsed).toMatchObject({
+      kind: "message",
+      threadId: "thread-live-tool",
+      message: {
+        id: "call_conversation_live_tool",
+        key: "device-9::thread-live-tool",
+        role: "tool",
+        eventType: "tool_call",
+        toolCall: {
+          name: "exec_command",
+          input: '{"cmd":"pwd"}'
+        }
+      }
+    });
+  });
+
+  it("prefers wrapped event timestamps over outer createdAt for live tool calls", () => {
+    const parsed = parseRpcNotification("device-9", {
+      method: "codex/event",
+      params: {
+        threadId: "thread-live-tool",
+        createdAt: "2026-03-08T08:09:59.994Z",
+        msg: {
+          timestamp: "2026-03-08T08:10:20.498Z",
+          type: "response_item",
+          payload: {
+            type: "function_call",
+            name: "exec_command",
+            arguments: JSON.stringify({
+              cmd: "pwd"
+            }),
+            call_id: "call_timestamped_live_tool"
+          }
+        }
+      }
+    });
+
+    expect(parsed).toMatchObject({
+      kind: "message",
+      threadId: "thread-live-tool",
+      message: {
+        id: "call_timestamped_live_tool",
+        createdAt: "2026-03-08T08:10:20.498Z",
+        role: "tool",
+        eventType: "tool_call",
+        toolCall: {
+          name: "exec_command",
+          input: '{"cmd":"pwd"}'
+        }
+      }
+    });
+  });
+
+  it("prefers top-level wrapped timestamps over stale nested createdAt values", () => {
+    const parsed = parseRpcNotification("device-9", {
+      method: "codex/event",
+      params: {
+        threadId: "thread-live-tool",
+        timestamp: "2026-03-08T08:10:20.498Z",
+        msg: {
+          createdAt: "2026-03-08T08:09:59.994Z",
+          type: "response_item",
+          payload: {
+            type: "function_call",
+            name: "exec_command",
+            arguments: JSON.stringify({
+              cmd: "pwd"
+            }),
+            call_id: "call_timestamped_top_level_tool"
+          }
+        }
+      }
+    });
+
+    expect(parsed).toMatchObject({
+      kind: "message",
+      threadId: "thread-live-tool",
+      message: {
+        id: "call_timestamped_top_level_tool",
+        createdAt: "2026-03-08T08:10:20.498Z",
+        role: "tool",
+        eventType: "tool_call"
       }
     });
   });
@@ -648,5 +912,50 @@ describe("extractItemMessagePayload", () => {
     expect(payload).toEqual({
       content: "Hello"
     });
+  });
+
+  it("does not misclassify commentary phase items as tool calls", () => {
+    const payload = extractItemMessagePayload(
+      {
+        phase: "commentary",
+        content:
+          "Ledger Snapshot: Code and tests are done; I'm collecting the exact file references."
+      },
+      "item/read",
+      "assistant"
+    );
+
+    expect(payload).toEqual({
+      content:
+        "Ledger Snapshot: Code and tests are done; I'm collecting the exact file references."
+    });
+  });
+
+  it("extracts structured tool call payloads with input and output", () => {
+    const payload = extractItemMessagePayload(
+      {
+        role: "tool",
+        toolName: "exec_command",
+        input: {
+          cmd: "grep -R \"vocab.bpe\" /tmp/llm.c"
+        },
+        output: {
+          exitCode: 0,
+          stdout: "/tmp/llm.c/README.md:18:make train_gpt2fp32cu"
+        }
+      },
+      "item/read",
+      "tool"
+    );
+
+    expect(payload).toMatchObject({
+      eventType: "tool_call",
+      toolCall: {
+        name: "exec_command",
+        input: "grep -R \"vocab.bpe\" /tmp/llm.c",
+        status: "completed"
+      }
+    });
+    expect(payload?.toolCall?.output).toContain("Process exited with code 0");
   });
 });

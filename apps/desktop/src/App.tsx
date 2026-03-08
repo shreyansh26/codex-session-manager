@@ -10,13 +10,35 @@ import {
   resolveSupportedModelId,
   resolveThinkingEffortForModel
 } from "./domain/modelCatalog";
-import type { SearchSessionHit, SessionCostDisplay } from "./domain/types";
+import type {
+  ChatMessage,
+  SearchSessionHit,
+  SessionCostDisplay,
+  ThreadHydrationState
+} from "./domain/types";
 import { shutdownRpcClients, useAppStore } from "./state/useAppStore";
+import { shallow } from "zustand/shallow";
 
 const REFRESH_INTERVAL_MS = 20_000;
 const SIDEBAR_MIN_WIDTH_PX = 280;
 const SIDEBAR_MAX_RATIO = 0.62;
 const SEARCH_DEBOUNCE_MS = 170;
+const EMPTY_MESSAGES: ChatMessage[] = [];
+const EMPTY_SEARCH_RESULTS: SearchSessionHit[] = [];
+const DEFAULT_THREAD_HYDRATION_STATE: ThreadHydrationState = {
+  baseLoading: false,
+  baseLoaded: false,
+  toolHistoryLoading: false
+};
+const SEARCH_IDLE_STATE = {
+  searchResults: EMPTY_SEARCH_RESULTS,
+  searchTotalHits: 0,
+  searchLoading: false,
+  searchHydrating: false,
+  searchHydratedCount: 0,
+  searchHydrationTotal: 0,
+  searchError: null as string | null
+};
 
 const clampSidebarWidth = (requested: number, shellWidth: number): number => {
   const maxWidth = Math.max(SIDEBAR_MIN_WIDTH_PX, Math.floor(shellWidth * SIDEBAR_MAX_RATIO));
@@ -61,20 +83,65 @@ export default function App() {
   const loading = useAppStore((state) => state.loading);
   const devices = useAppStore((state) => state.devices);
   const sessions = useAppStore((state) => state.sessions);
-  const selectedSessionKey = useAppStore((state) => state.selectedSessionKey);
-  const messagesBySession = useAppStore((state) => state.messagesBySession);
-  const tokenUsageBySession = useAppStore((state) => state.tokenUsageBySession);
-  const modelBySession = useAppStore((state) => state.modelBySession);
-  const costUsdBySession = useAppStore((state) => state.costUsdBySession);
+  const selectedSession = useAppStore((state) => {
+    const selectedSessionKey = state.selectedSessionKey;
+    if (!selectedSessionKey) {
+      return null;
+    }
+    return state.sessions.find((session) => session.key === selectedSessionKey) ?? null;
+  });
+  const selectedSessionKey = selectedSession?.key ?? null;
+  const messages = useAppStore((state) => {
+    const key = state.selectedSessionKey;
+    return key ? state.messagesBySession[key] ?? EMPTY_MESSAGES : EMPTY_MESSAGES;
+  });
+  const selectedThreadHydration = useAppStore((state) => {
+    const key = state.selectedSessionKey;
+    return key
+      ? state.threadHydrationBySession[key] ?? DEFAULT_THREAD_HYDRATION_STATE
+      : DEFAULT_THREAD_HYDRATION_STATE;
+  });
+  const selectedModel = useAppStore((state) =>
+    pickThreadScopedValue(
+      state.modelBySession,
+      state.selectedSessionKey,
+      selectedSession?.threadId
+    )
+  );
+  const selectedTokenUsage = useAppStore((state) =>
+    pickThreadScopedValue(
+      state.tokenUsageBySession,
+      state.selectedSessionKey,
+      selectedSession?.threadId
+    )
+  );
+  const selectedUsdCost = useAppStore((state) =>
+    pickThreadScopedValue(
+      state.costUsdBySession,
+      state.selectedSessionKey,
+      selectedSession?.threadId
+    )
+  );
   const availableModelsByDevice = useAppStore((state) => state.availableModelsByDevice);
-  const composerPrefsBySession = useAppStore((state) => state.composerPrefsBySession);
-  const searchResults = useAppStore((state) => state.searchResults);
-  const searchTotalHits = useAppStore((state) => state.searchTotalHits);
-  const searchLoading = useAppStore((state) => state.searchLoading);
-  const searchHydrating = useAppStore((state) => state.searchHydrating);
-  const searchHydratedCount = useAppStore((state) => state.searchHydratedCount);
-  const searchHydrationTotal = useAppStore((state) => state.searchHydrationTotal);
-  const searchError = useAppStore((state) => state.searchError);
+  const selectedComposerPreference = useAppStore((state) => {
+    const key = state.selectedSessionKey;
+    return key ? state.composerPrefsBySession[key] : undefined;
+  });
+  const searchState = useAppStore(
+    (state) =>
+      searchQueryText.trim().length > 0
+        ? {
+            searchResults: state.searchResults,
+            searchTotalHits: state.searchTotalHits,
+            searchLoading: state.searchLoading,
+            searchHydrating: state.searchHydrating,
+            searchHydratedCount: state.searchHydratedCount,
+            searchHydrationTotal: state.searchHydrationTotal,
+            searchError: state.searchError
+          }
+        : SEARCH_IDLE_STATE,
+    shallow
+  );
   const globalError = useAppStore((state) => state.globalError);
 
   const initialize = useAppStore((state) => state.initialize);
@@ -175,37 +242,22 @@ export default function App() {
     };
   }, [searchDeviceScope, searchQueryText, runChatSearch, clearChatSearch]);
 
-  const selectedSession = useMemo(
-    () => sessions.find((session) => session.key === selectedSessionKey) ?? null,
-    [sessions, selectedSessionKey]
-  );
-
-  const messages = selectedSessionKey ? messagesBySession[selectedSessionKey] ?? [] : [];
   const costDisplay: SessionCostDisplay = useMemo(() => {
     if (!selectedSessionKey) {
       return { costAvailable: false };
     }
 
-    const threadId = selectedSession?.threadId;
-    const model = pickThreadScopedValue(modelBySession, selectedSessionKey, threadId);
-    const tokenUsage = pickThreadScopedValue(
-      tokenUsageBySession,
-      selectedSessionKey,
-      threadId
-    );
-    const usdCost = pickThreadScopedValue(costUsdBySession, selectedSessionKey, threadId);
     return {
-      ...(model ? { model } : {}),
-      ...(tokenUsage ? { tokenUsage } : {}),
-      ...(typeof usdCost === "number" ? { usdCost } : {}),
-      costAvailable: typeof usdCost === "number"
+      ...(selectedModel ? { model: selectedModel } : {}),
+      ...(selectedTokenUsage ? { tokenUsage: selectedTokenUsage } : {}),
+      ...(typeof selectedUsdCost === "number" ? { usdCost: selectedUsdCost } : {}),
+      costAvailable: typeof selectedUsdCost === "number"
     };
   }, [
-    selectedSession,
     selectedSessionKey,
-    modelBySession,
-    tokenUsageBySession,
-    costUsdBySession
+    selectedModel,
+    selectedTokenUsage,
+    selectedUsdCost
   ]);
 
   const composerSelection = useMemo(() => {
@@ -217,17 +269,14 @@ export default function App() {
       };
     }
 
-    const currentPreference = composerPrefsBySession[selectedSessionKey];
+    const currentPreference = selectedComposerPreference;
     const model = resolveComposerModel(currentPreference?.model);
     const thinkingEffort = resolveThinkingEffortForModel(
       model,
       currentPreference?.thinkingEffort
     );
     return { model, thinkingEffort };
-  }, [
-    selectedSessionKey,
-    composerPrefsBySession
-  ]);
+  }, [selectedSessionKey, selectedComposerPreference]);
 
   const modelOptions = useMemo(() => {
     const rawAvailable =
@@ -368,30 +417,31 @@ export default function App() {
           <section className="workspace__search-results">
             <div className="workspace__search-results-meta">
               <p>
-                {searchLoading
+                {searchState.searchLoading
                   ? "Searching..."
-                  : `${searchTotalHits} match${searchTotalHits === 1 ? "" : "es"}`}
+                  : `${searchState.searchTotalHits} match${searchState.searchTotalHits === 1 ? "" : "es"}`}
               </p>
-              {!searchLoading && searchResults.length > 0 ? (
-                <p>Showing top {searchResults.length} session matches</p>
+              {!searchState.searchLoading && searchState.searchResults.length > 0 ? (
+                <p>Showing top {searchState.searchResults.length} session matches</p>
               ) : null}
-              {searchHydrating ? (
+              {searchState.searchHydrating ? (
                 <p>
-                  Hydrating sessions {searchHydratedCount}/{searchHydrationTotal || "?"}
+                  Hydrating sessions {searchState.searchHydratedCount}/
+                  {searchState.searchHydrationTotal || "?"}
                 </p>
               ) : null}
-              {searchError ? (
-                <p className="workspace__search-results-error">{searchError}</p>
+              {searchState.searchError ? (
+                <p className="workspace__search-results-error">{searchState.searchError}</p>
               ) : null}
             </div>
 
-            {searchResults.length === 0 && !searchLoading ? (
+            {searchState.searchResults.length === 0 && !searchState.searchLoading ? (
               <p className="workspace__search-results-empty">
                 No high-confidence matches found.
               </p>
             ) : (
               <ul className="workspace__search-group-list">
-                {searchResults.map((sessionHit) => (
+                {searchState.searchResults.map((sessionHit) => (
                   <li key={sessionHit.sessionKey} className="workspace__search-group">
                     <button
                       type="button"
@@ -424,7 +474,12 @@ export default function App() {
           </section>
         ) : null}
 
-        <ChatPanel session={selectedSession} messages={messages} costDisplay={costDisplay} />
+        <ChatPanel
+          session={selectedSession}
+          messages={messages}
+          costDisplay={costDisplay}
+          hydrationState={selectedThreadHydration}
+        />
         <Composer
           sessionKey={selectedSessionKey}
           disabled={loading || selectedSessionKey === null}

@@ -1,8 +1,4 @@
-import type {
-  DeviceRecord,
-  SearchIndexThreadPayload,
-  SessionSummary
-} from "../domain/types";
+import type { DeviceRecord, SearchIndexThreadPayload, SessionSummary } from "../domain/types";
 
 export type SearchHydrationWorkerRequest =
   | {

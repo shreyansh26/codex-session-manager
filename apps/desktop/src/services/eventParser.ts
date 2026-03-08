@@ -15,6 +15,12 @@ export interface ParsedMessageEvent {
 
 export type ParsedRpcEvent = ParsedMessageEvent;
 
+export interface ExtractedMessagePayload {
+  content: string;
+  eventType?: ChatMessage["eventType"];
+  toolCall?: ChatMessage["toolCall"];
+}
+
 export interface ParsedThreadTokenUsageEvent {
   threadId: string;
   turnId?: string;
@@ -45,13 +51,34 @@ const activityKeywords = [
   "explore"
 ];
 
+const structuredToolKeywords = [
+  "tool",
+  "exec",
+  "command",
+  "shell",
+  "patch",
+  "search",
+  "read",
+  "write",
+  "file",
+  "diff",
+  "stdin"
+];
+
 export const parseRpcNotification = (
   deviceId: string,
   notification: RpcNotification
 ): ParsedRpcEvent | null => {
   const method = normalizeMethod(notification.method);
   const params = asRecord(notification.params);
-  const directThreadId = pickString(params, ["threadId", "thread_id"]);
+  const directThreadId = pickString(params, [
+    "threadId",
+    "thread_id",
+    "conversationId",
+    "conversation_id",
+    "sessionId",
+    "session_id"
+  ]);
 
   if (method.startsWith("message/")) {
     const messageRecord = asRecord(params?.message) ?? params;
@@ -68,16 +95,7 @@ export const parseRpcNotification = (
     const images = extractImageAttachments(messageRecord);
 
     const createdAtRaw =
-      pickString(messageRecord, [
-        "completedAt",
-        "completed_at",
-        "createdAt",
-        "created_at",
-        "startedAt",
-        "started_at",
-        "updatedAt",
-        "updated_at"
-      ]) ?? new Date().toISOString();
+      pickNotificationTimestamp(messageRecord, params) ?? new Date().toISOString();
 
     const createdAt = normalizeTimestamp(createdAtRaw) ?? new Date().toISOString();
 
@@ -85,16 +103,22 @@ export const parseRpcNotification = (
       kind: "message",
       threadId,
       message: {
-        id:
-          pickString(messageRecord, ["id", "messageId", "itemId", "eventId"]) ??
-          fallbackStreamMessageId({
-            threadId,
-            role,
-            eventType: payload.eventType,
-            method,
-            params,
-            record: messageRecord
-          }),
+        id: toTimelineMessageId({
+          baseId:
+            pickString(messageRecord, ["id", "messageId", "itemId", "eventId"]) ??
+            buildStableMessageId({
+              threadId,
+              role,
+              eventType: payload.eventType,
+              method,
+              createdAt,
+              record: messageRecord,
+              payload,
+              turnId: extractTurnId(params, messageRecord)
+            }),
+          eventType: payload.eventType,
+          createdAt
+        }),
         key: `${deviceId}::${threadId}`,
         threadId,
         deviceId,
@@ -102,31 +126,117 @@ export const parseRpcNotification = (
         content: payload.content,
         createdAt,
         ...(images.length > 0 ? { images } : {}),
-        ...(payload.eventType ? { eventType: payload.eventType } : {})
+        ...(payload.eventType ? { eventType: payload.eventType } : {}),
+        ...(payload.toolCall ? { toolCall: payload.toolCall } : {})
       }
     };
   }
 
   if (!method.startsWith("item/")) {
-    if (!directThreadId || !isActivityMethod(method)) {
+    const rawActivityRecord = asRecord(params?.msg) ?? params;
+    const wrappedPayloadRecord = asRecord(rawActivityRecord?.payload);
+    const activityRecord =
+      pickString(rawActivityRecord, ["type"]) === "response_item" && wrappedPayloadRecord
+        ? wrappedPayloadRecord
+        : rawActivityRecord;
+    const activityThreadId =
+      directThreadId ??
+      pickString(rawActivityRecord, [
+        "threadId",
+        "thread_id",
+        "sessionId",
+        "session_id",
+        "conversationId",
+        "conversation_id"
+      ]) ??
+      pickString(activityRecord, [
+        "threadId",
+        "thread_id",
+        "sessionId",
+        "session_id",
+        "conversationId",
+        "conversation_id"
+      ]);
+    if (!activityThreadId || !activityRecord) {
       return null;
     }
 
-    const summary = summarizeActivity(params ?? {}, method) ?? `Activity: ${method}`;
+    const activityTypeHint = (
+      pickString(activityRecord, ["type", "itemType", "kind"]) ?? ""
+    ).toLowerCase();
+    const inferredActivityRole: ChatRole =
+      activityTypeHint.includes("function_call") ||
+      activityTypeHint.includes("tool_call") ||
+      activityTypeHint.includes("custom_tool") ||
+      (pickString(activityRecord, ["call_id", "callId"]) !== null &&
+        pickString(activityRecord, ["name"]) !== null)
+        ? "tool"
+        : inferRole(activityRecord);
+    const activityPayload = extractItemMessagePayload(
+      activityRecord,
+      method,
+      inferredActivityRole
+    );
+    if (!activityPayload) {
+      return null;
+    }
+    if (!isActivityMethod(method) && !activityPayload.toolCall) {
+      return null;
+    }
+
+    const createdAtRaw =
+      pickNotificationTimestamp(activityRecord, rawActivityRecord, params) ??
+      new Date().toISOString();
+    const createdAt = normalizeTimestamp(createdAtRaw) ?? new Date().toISOString();
+    const baseId =
+      pickString(activityRecord, [
+        "id",
+        "itemId",
+        "eventId",
+        "event_id",
+        "turnId",
+        "turn_id",
+        "call_id",
+        "callId"
+      ]) ??
+      pickString(rawActivityRecord, [
+        "id",
+        "itemId",
+        "eventId",
+        "event_id",
+        "turnId",
+        "turn_id",
+        "call_id",
+        "callId"
+      ]) ??
+      pickString(params, ["id", "eventId", "turnId"]) ??
+      buildStableMessageId({
+        threadId: activityThreadId,
+        role: activityPayload.toolCall ? "tool" : "system",
+        eventType: activityPayload.eventType,
+        method,
+        createdAt,
+        record: activityRecord,
+        payload: activityPayload
+      });
+
     return {
       kind: "message",
-      threadId: directThreadId,
+      threadId: activityThreadId,
       message: {
-        id:
-          pickString(params, ["id", "eventId", "turnId"]) ??
-          `${directThreadId}-activity-${Date.now().toString(36)}-${method.replace("/", "-")}`,
-        key: `${deviceId}::${directThreadId}`,
-        threadId: directThreadId,
+        id: toTimelineMessageId({
+          baseId,
+          eventType: activityPayload.eventType,
+          createdAt
+        }),
+        key: `${deviceId}::${activityThreadId}`,
+        threadId: activityThreadId,
         deviceId,
-        role: "tool",
-        content: summary,
-        createdAt: new Date().toISOString(),
-        eventType: "activity"
+        role: activityPayload.toolCall ? "tool" : "system",
+        content: activityPayload.content,
+        createdAt,
+        ...(activityPayload.eventType ? { eventType: activityPayload.eventType } : {}),
+        ...(activityPayload.toolCall ? { toolCall: activityPayload.toolCall } : {})
       }
     };
   }
@@ -149,16 +259,7 @@ export const parseRpcNotification = (
   const images = extractImageAttachments(item);
 
   const createdAtRaw =
-    pickString(item, [
-      "completedAt",
-      "completed_at",
-      "updatedAt",
-      "updated_at",
-      "createdAt",
-      "created_at",
-      "startedAt",
-      "started_at"
-    ]) ?? new Date().toISOString();
+    pickNotificationTimestamp(item, params) ?? new Date().toISOString();
 
   const createdAt = normalizeTimestamp(createdAtRaw);
   if (!createdAt) {
@@ -169,16 +270,22 @@ export const parseRpcNotification = (
     kind: "message",
     threadId,
     message: {
-      id:
-        pickString(item, ["id", "itemId", "eventId"]) ??
-        fallbackStreamMessageId({
-          threadId,
-          role,
-          eventType: payload.eventType,
-          method,
-          params,
-          record: item
-        }),
+      id: toTimelineMessageId({
+        baseId:
+          pickString(item, ["id", "itemId", "eventId"]) ??
+          buildStableMessageId({
+            threadId,
+            role,
+            eventType: payload.eventType,
+            method,
+            createdAt,
+            record: item,
+            payload,
+            turnId: extractTurnId(params, item)
+          }),
+        eventType: payload.eventType,
+        createdAt
+      }),
       key: `${deviceId}::${threadId}`,
       threadId,
       deviceId,
@@ -186,7 +293,8 @@ export const parseRpcNotification = (
       content: payload.content,
       createdAt,
       ...(images.length > 0 ? { images } : {}),
-      ...(payload.eventType ? { eventType: payload.eventType } : {})
+      ...(payload.eventType ? { eventType: payload.eventType } : {}),
+      ...(payload.toolCall ? { toolCall: payload.toolCall } : {})
     }
   };
 };
@@ -419,11 +527,20 @@ export const extractItemMessagePayload = (
   item: Record<string, unknown>,
   method: string,
   role: ChatRole
-): { content: string; eventType?: ChatMessage["eventType"] } | null => {
+): ExtractedMessagePayload | null => {
   const rawContent = extractText(item);
   const preserveRawChunk = shouldPreserveRawChunk(method, role);
   const content = preserveRawChunk ? rawContent : rawContent.trim();
-  const eventType = inferEventType(item, method, role);
+  const toolCall = extractStructuredToolCall(item, method, role, content);
+  const eventType = toolCall ? "tool_call" : inferEventType(item, method, role);
+
+  if (toolCall) {
+    return {
+      content: buildToolCallContent(toolCall, content),
+      eventType,
+      toolCall
+    };
+  }
 
   if (content.trim().length > 0) {
     return {
@@ -536,6 +653,29 @@ export const extractImageAttachments = (input: unknown): ChatImageAttachment[] =
   return attachments;
 };
 
+const pickNotificationTimestamp = (
+  ...records: Array<Record<string, unknown> | null | undefined>
+): string | null => {
+  const fieldPriority = [
+    ["completedAt", "completed_at"],
+    ["updatedAt", "updated_at"],
+    ["timestamp"],
+    ["createdAt", "created_at"],
+    ["startedAt", "started_at"]
+  ];
+
+  for (const keys of fieldPriority) {
+    for (const record of records) {
+      const timestamp = pickString(record ?? null, keys) ?? null;
+      if (timestamp) {
+        return timestamp;
+      }
+    }
+  }
+
+  return null;
+};
+
 const extractImageUrlFromRecord = (
   value: Record<string, unknown>
 ): string | null => {
@@ -593,6 +733,577 @@ const inferMimeTypeFromDataUrl = (value: string): string | null => {
   const match = value.match(/^data:(image\/[a-z0-9.+-]+);/i);
   return match?.[1]?.toLowerCase() ?? null;
 };
+
+const extractWebSearchToolCall = (
+  item: Record<string, unknown>
+): ChatMessage["toolCall"] | undefined => {
+  const typeHint = (pickString(item, ["type", "itemType", "kind"]) ?? "").toLowerCase();
+  if (typeHint !== "web_search_call") {
+    return undefined;
+  }
+
+  const input = formatWebSearchActionInput(item.action);
+  const status = inferToolCallStatus(item, "web_search_call", null) ?? "completed";
+
+  return {
+    name: "web_search",
+    ...(input ? { input } : {}),
+    status
+  };
+};
+
+const formatWebSearchActionInput = (value: unknown): string | undefined => {
+  const record = asRecord(value);
+  if (!record) {
+    return undefined;
+  }
+
+  const type = pickString(record, ["type"]) ?? "search";
+  const query = pickString(record, ["query"]);
+  const url = pickString(record, ["url"]);
+  const pattern = pickString(record, ["pattern"]);
+  const queries = Array.isArray(record.queries)
+    ? record.queries
+        .filter((entry): entry is string => typeof entry === "string")
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0)
+    : [];
+
+  return (
+    stringifyJson({
+      type,
+      ...(query ? { query } : {}),
+      ...(url ? { url } : {}),
+      ...(pattern ? { pattern } : {}),
+      ...(queries.length > 0 ? { queries } : {})
+    }) ?? undefined
+  );
+};
+
+const extractStructuredToolCall = (
+  item: Record<string, unknown>,
+  method: string,
+  role: ChatRole,
+  content: string
+): ChatMessage["toolCall"] | undefined => {
+  const webSearchToolCall = extractWebSearchToolCall(item);
+  if (webSearchToolCall) {
+    return webSearchToolCall;
+  }
+
+  const methodLower = method.toLowerCase();
+  const explicitName = pickToolName(item, methodLower, role, false);
+  const input = extractToolInput(item);
+  const output = extractToolOutput(item, content, input);
+  const methodSignalsTool =
+    !isSyntheticReadMethod(methodLower) &&
+    structuredToolKeywords.some((keyword) => methodLower.includes(keyword));
+  const hasToolPayloadFields = hasDirectToolPayload(item);
+  const hasExecutionResultFields = hasExecutionMetadata(item);
+  const hasInvocationEvidence =
+    role === "tool" ||
+    explicitName !== null ||
+    methodSignalsTool ||
+    hasToolPayloadFields ||
+    hasExecutionResultFields;
+
+  if (!hasInvocationEvidence) {
+    return undefined;
+  }
+
+  if (!explicitName && !input && !output) {
+    return undefined;
+  }
+
+  const name = explicitName ?? pickToolName(item, methodLower, role, true);
+  const status = inferToolCallStatus(item, methodLower, output);
+
+  return {
+    name: name ?? "tool",
+    ...(input ? { input } : {}),
+    ...(output ? { output } : {}),
+    ...(status ? { status } : {})
+  };
+};
+
+const pickToolName = (
+  item: Record<string, unknown>,
+  normalizedMethod: string,
+  role: ChatRole,
+  allowMethodFallback: boolean
+): string | null => {
+  const nestedInput = asRecord(item.input);
+  const nestedArgs = asRecord(item.args);
+  const nestedArguments = asRecord(item.arguments);
+
+  const direct =
+    pickString(item, ["toolName", "tool_name", "tool"]) ??
+    pickString(nestedInput, ["toolName", "tool_name", "tool"]) ??
+    pickString(nestedArgs, ["toolName", "tool_name", "tool"]) ??
+    pickString(nestedArguments, ["toolName", "tool_name", "tool"]) ??
+    (role === "tool"
+      ? pickString(item, ["name"]) ??
+        pickString(nestedInput, ["name"]) ??
+        pickString(nestedArgs, ["name"]) ??
+        pickString(nestedArguments, ["name"])
+      : null);
+  if (direct) {
+    return direct;
+  }
+
+  const typeHint = (
+    pickString(item, ["type", "itemType", "kind", "action"]) ?? ""
+  ).trim();
+  if (
+    typeHint.length > 0 &&
+    (role === "tool" || isStrongToolTypeHint(typeHint))
+  ) {
+    return typeHint;
+  }
+
+  if (!allowMethodFallback) {
+    return null;
+  }
+
+  const methodSegments = normalizedMethod.split("/").filter((segment) => segment.length > 0);
+  if (methodSegments.length === 0) {
+    return null;
+  }
+  return methodSegments.join("_");
+};
+
+const isStrongToolTypeHint = (value: string): boolean => {
+  const normalized = value.toLowerCase();
+  return (
+    normalized.includes("tool") ||
+    normalized.includes("exec") ||
+    normalized.includes("command") ||
+    normalized.includes("patch") ||
+    normalized.includes("search") ||
+    normalized.includes("write") ||
+    normalized.includes("diff") ||
+    normalized.includes("stdin")
+  );
+};
+
+const hasDirectToolPayload = (item: Record<string, unknown>): boolean => {
+  if (
+    pickString(item, [
+      "cmd",
+      "command",
+      "shellCommand",
+      "shell_command",
+      "patch",
+      "diff",
+      "chars",
+      "cwd",
+      "workdir",
+      "workingDirectory",
+      "path",
+      "file",
+      "filePath",
+      "file_path"
+    ]) !== null
+  ) {
+    return true;
+  }
+
+  const nestedInput = asRecord(item.input);
+  const nestedArgs = asRecord(item.args);
+  const nestedArguments = asRecord(item.arguments);
+  return [nestedInput, nestedArgs, nestedArguments].some(
+    (record) =>
+      record !== null &&
+      pickString(record, [
+        "cmd",
+        "command",
+        "shellCommand",
+        "shell_command",
+        "patch",
+        "diff",
+        "chars",
+        "cwd",
+        "workdir",
+        "workingDirectory",
+        "path",
+        "file",
+        "filePath",
+        "file_path"
+      ]) !== null
+  );
+};
+
+const hasExecutionMetadata = (item: Record<string, unknown>): boolean => {
+  if (
+    pickString(item, ["stdout", "stderr", "chunkId", "chunk_id"]) !== null ||
+    pickNumber(item, [
+      "exitCode",
+      "exit_code",
+      "code",
+      "wallTime",
+      "wall_time",
+      "wallTimeSeconds",
+      "wall_time_seconds",
+      "originalTokenCount",
+      "original_token_count"
+    ]) !== null
+  ) {
+    return true;
+  }
+
+  const nestedOutput =
+    asRecord(item.output) ?? asRecord(item.result) ?? asRecord(item.response);
+  if (!nestedOutput) {
+    return false;
+  }
+
+  return (
+    pickString(nestedOutput, ["stdout", "stderr", "chunkId", "chunk_id"]) !== null ||
+    pickNumber(nestedOutput, [
+      "exitCode",
+      "exit_code",
+      "code",
+      "wallTime",
+      "wall_time",
+      "wallTimeSeconds",
+      "wall_time_seconds",
+      "originalTokenCount",
+      "original_token_count"
+    ]) !== null
+  );
+};
+
+const extractToolInput = (item: Record<string, unknown>): string | null => {
+  const directValue =
+    item.input ??
+    item.args ??
+    item.arguments ??
+    item.payload ??
+    item.request ??
+    item.parameters;
+  const formattedDirect = formatToolPayload(directValue, { preferCommand: true });
+  if (formattedDirect) {
+    return formattedDirect;
+  }
+
+  const command = pickString(item, ["cmd", "command", "shellCommand", "shell_command"]);
+  if (command) {
+    return command;
+  }
+
+  const patch = pickString(item, ["patch", "diff"]);
+  if (patch) {
+    return patch;
+  }
+
+  const chars = pickString(item, ["chars"]);
+  if (chars) {
+    return chars;
+  }
+
+  const cleaned = cleanToolRecord(item, [
+    "threadId",
+    "thread_id",
+    "id",
+    "eventId",
+    "event_id",
+    "messageId",
+    "message_id",
+    "itemId",
+    "item_id",
+    "role",
+    "author",
+    "type",
+    "itemType",
+    "status",
+    "state",
+    "kind",
+    "action",
+    "createdAt",
+    "created_at",
+    "updatedAt",
+    "updated_at",
+    "startedAt",
+    "started_at",
+    "completedAt",
+    "completed_at",
+    "output",
+    "result",
+    "response",
+    "stdout",
+    "stderr",
+    "content",
+    "text",
+    "delta",
+    "summary"
+  ]);
+  return stringifyJson(cleaned);
+};
+
+const extractToolOutput = (
+  item: Record<string, unknown>,
+  content: string,
+  input: string | null
+): string | null => {
+  const directValue = item.output ?? item.result ?? item.response;
+  const formattedDirect = formatToolOutputPayload(directValue);
+  if (formattedDirect) {
+    return formattedDirect;
+  }
+
+  const formattedExecution = formatExecutionOutput(item);
+  if (formattedExecution) {
+    return formattedExecution;
+  }
+
+  const normalizedContent = content.trim();
+  if (
+    normalizedContent.length > 0 &&
+    (!input || normalizeText(normalizedContent) !== normalizeText(input))
+  ) {
+    return normalizedContent;
+  }
+
+  return null;
+};
+
+const inferToolCallStatus = (
+  item: Record<string, unknown>,
+  methodLower: string,
+  output: string | null
+): "running" | "completed" | "failed" | undefined => {
+  const rawStatus =
+    (
+      pickString(item, ["status", "state", "phase", "result"]) ??
+      (methodLower.includes("failed")
+        ? "failed"
+        : methodLower.includes("completed")
+          ? "completed"
+          : methodLower.includes("started")
+            ? "running"
+            : null)
+    )?.toLowerCase() ?? null;
+
+  if (!rawStatus) {
+    return output ? "completed" : undefined;
+  }
+  if (
+    rawStatus.includes("fail") ||
+    rawStatus.includes("error") ||
+    rawStatus.includes("reject")
+  ) {
+    return "failed";
+  }
+  if (
+    rawStatus.includes("complete") ||
+    rawStatus.includes("success") ||
+    rawStatus.includes("done")
+  ) {
+    return "completed";
+  }
+  if (
+    rawStatus.includes("start") ||
+    rawStatus.includes("run") ||
+    rawStatus.includes("progress") ||
+    rawStatus.includes("pending")
+  ) {
+    return "running";
+  }
+  return output ? "completed" : undefined;
+};
+
+const buildToolCallContent = (
+  toolCall: NonNullable<ChatMessage["toolCall"]>,
+  content: string
+): string => {
+  const parts = [`Tool: ${toolCall.name}`];
+  if (toolCall.input) {
+    parts.push(`Input:\n${toolCall.input}`);
+  }
+  if (toolCall.output) {
+    parts.push(`Output:\n${toolCall.output}`);
+  } else if (content.trim().length > 0 && normalizeText(content) !== normalizeText(toolCall.input ?? "")) {
+    parts.push(content.trim());
+  }
+  return parts.join("\n\n");
+};
+
+const formatToolOutputPayload = (value: unknown): string | null => {
+  const executionLike = formatExecutionOutput(value);
+  if (executionLike) {
+    return executionLike;
+  }
+  return formatToolPayload(value, { preferCommand: false });
+};
+
+const formatExecutionOutput = (value: unknown): string | null => {
+  const record = asRecord(value);
+  if (!record) {
+    return null;
+  }
+
+  const chunkId = pickStringDeep(record, ["chunkId", "chunk_id"]);
+  const wallTime = pickNumberDeep(record, [
+    "wallTime",
+    "wall_time",
+    "wallTimeSeconds",
+    "wall_time_seconds",
+    "durationSeconds",
+    "duration_seconds"
+  ]);
+  const exitCode = pickNumberDeep(record, ["exitCode", "exit_code", "code"]);
+  const originalTokenCount = pickNumberDeep(record, [
+    "originalTokenCount",
+    "original_token_count"
+  ]);
+  const outputText =
+    combineOutputStreams(record) ??
+    formatToolPayload(record.output, { preferCommand: false }) ??
+    formatToolPayload(record.result, { preferCommand: false }) ??
+    formatToolPayload(record.response, { preferCommand: false });
+
+  const lines: string[] = [];
+  if (chunkId) {
+    lines.push(`Chunk ID: ${chunkId}`);
+  }
+  if (wallTime !== null) {
+    lines.push(`Wall time: ${wallTime} seconds`);
+  }
+  if (exitCode !== null) {
+    lines.push(`Process exited with code ${exitCode}`);
+  }
+  if (originalTokenCount !== null) {
+    lines.push(`Original token count: ${originalTokenCount}`);
+  }
+  if (outputText) {
+    if (lines.length > 0) {
+      lines.push("Output:");
+    }
+    lines.push(outputText);
+  }
+
+  return lines.length > 0 ? lines.join("\n") : null;
+};
+
+const combineOutputStreams = (record: Record<string, unknown>): string | null => {
+  const stdout = pickString(record, ["stdout"]);
+  const stderr = pickString(record, ["stderr"]);
+  const output = pickString(record, ["output"]);
+
+  const parts = [stdout, stderr, output]
+    .map((part) => (typeof part === "string" ? sanitizeExecutionText(part) : null))
+    .filter((part): part is string => typeof part === "string" && part.trim().length > 0);
+  if (parts.length === 0) {
+    return null;
+  }
+  return parts.join("\n");
+};
+
+const sanitizeExecutionText = (value: string): string =>
+  value
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\r/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+const formatToolPayload = (
+  value: unknown,
+  options: { preferCommand: boolean }
+): string | null => {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value === "string") {
+    const sanitized = sanitizeExecutionText(value);
+    return sanitized.length > 0 ? sanitized : null;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    const text = extractText(value).trim();
+    if (text.length > 0) {
+      return text;
+    }
+    return stringifyJson(value);
+  }
+
+  const record = asRecord(value);
+  if (!record) {
+    return null;
+  }
+
+  if (options.preferCommand) {
+    const command = pickStringDeep(record, [
+      "cmd",
+      "command",
+      "shellCommand",
+      "shell_command"
+    ]);
+    if (command) {
+      return command;
+    }
+  }
+
+  const patch = pickString(record, ["patch", "diff"]);
+  if (patch) {
+    return patch;
+  }
+
+  const chars = pickString(record, ["chars"]);
+  if (chars) {
+    return chars;
+  }
+
+  const text = extractText(record).trim();
+  if (text.length > 0) {
+    return text;
+  }
+
+  return stringifyJson(record);
+};
+
+const cleanToolRecord = (
+  record: Record<string, unknown>,
+  excludedKeys: string[]
+): Record<string, unknown> | null => {
+  const excluded = new Set(excludedKeys);
+  const cleanedEntries = Object.entries(record).filter(([key, value]) => {
+    if (excluded.has(key)) {
+      return false;
+    }
+    if (value === null || value === undefined) {
+      return false;
+    }
+    if (typeof value === "string" && value.trim().length === 0) {
+      return false;
+    }
+    return true;
+  });
+
+  if (cleanedEntries.length === 0) {
+    return null;
+  }
+
+  return Object.fromEntries(cleanedEntries);
+};
+
+const stringifyJson = (value: unknown): string | null => {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  try {
+    const serialized = JSON.stringify(value, null, 2);
+    return serialized && serialized !== "{}" && serialized !== "[]"
+      ? serialized
+      : null;
+  } catch {
+    return null;
+  }
+};
+
+const normalizeText = (value: string): string =>
+  value.replace(/\s+/g, " ").trim();
 
 const inferRole = (item: Record<string, unknown>): ChatRole => {
   const role = pickString(item, ["role", "author"]);
@@ -735,32 +1446,55 @@ const shouldPreserveRawChunk = (method: string, role: ChatRole): boolean => {
   return normalized.includes("delta") && role !== "user";
 };
 
-const fallbackStreamMessageId = (params: {
+export const buildStableMessageId = (params: {
   threadId: string;
   role: ChatRole;
   eventType?: ChatMessage["eventType"];
   method: string;
-  params: Record<string, unknown> | null;
+  createdAt: string;
   record: Record<string, unknown>;
+  payload: ExtractedMessagePayload;
+  turnId?: string | null;
 }): string => {
-  const turnId = extractTurnId(params.params, params.record);
-  const streamKind =
-    pickString(params.record, ["type", "itemType", "kind", "name"]) ??
-    pickString(asRecord(params.record.item), ["type", "itemType", "kind", "name"]) ??
-    "stream";
+  const resolvedTurnId = params.turnId ?? extractTurnId(null, params.record);
+  const fingerprintSource = params.payload.toolCall
+    ? [
+        params.payload.toolCall.name,
+        params.payload.toolCall.input ?? "",
+        params.payload.toolCall.output ?? ""
+      ].join(" ")
+    : params.payload.content;
+  const fingerprint =
+    stableMessageFingerprint(fingerprintSource) ??
+    stableMessageFingerprint(
+      pickString(params.record, ["type", "itemType", "kind", "name"]) ?? "message"
+    ) ??
+    "message";
 
-  if (turnId) {
-    return [
-      params.threadId,
-      turnId,
-      params.role,
-      params.eventType ?? "message",
-      params.method.replaceAll("/", "-"),
-      streamKind
-    ].join("::");
+  return [
+    params.threadId,
+    resolvedTurnId ?? "no-turn",
+    params.role,
+    params.eventType ?? "message",
+    params.method.replaceAll("/", "-"),
+    fingerprint,
+    params.createdAt
+  ].join("::");
+};
+
+export const toTimelineMessageId = (params: {
+  baseId: string;
+  eventType?: ChatMessage["eventType"];
+  createdAt: string;
+}): string => {
+  if (params.eventType !== "reasoning") {
+    return params.baseId;
   }
 
-  return `${params.threadId}-${params.role}-${Date.now().toString(36)}-${params.method.replace("/", "-")}`;
+  const suffix = `::${params.createdAt}`;
+  return params.baseId.endsWith(suffix)
+    ? params.baseId
+    : `${params.baseId}${suffix}`;
 };
 
 const extractTurnId = (
@@ -787,6 +1521,20 @@ const normalizeTimestamp = (value: string): string | null => {
 
 const methodMatches = (method: string, ...candidates: string[]): boolean =>
   candidates.some((candidate) => method === candidate || method.endsWith(`/${candidate}`));
+
+const stableMessageFingerprint = (value: string): string | null => {
+  const normalized = value
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[^a-z0-9._/-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[-/]+|[-/]+$/g, "");
+  if (normalized.length === 0) {
+    return null;
+  }
+  return normalized.slice(0, 80);
+};
 
 const normalizeEventType = (value: string | null | undefined): string => {
   if (!value) {

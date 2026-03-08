@@ -22,6 +22,9 @@ use crate::state::search_index::{
     SearchQueryRequest, SearchQueryResponse,
 };
 
+const DEFAULT_APP_SERVER_APPROVAL_CONFIG: &str = "approval_policy=\"never\"";
+const DEFAULT_APP_SERVER_SANDBOX_CONFIG: &str = "sandbox_mode=\"danger-full-access\"";
+
 pub struct AppState {
     inner: Mutex<InnerState>,
     storage_path: PathBuf,
@@ -566,14 +569,10 @@ fn spawn_local_runtime(config: &LocalDeviceConfig) -> Result<ConnectionRuntime, 
 
     let (program, args) = if cfg!(target_os = "windows") {
         let program = config.codex_bin.as_deref().unwrap_or("codex").to_owned();
-        let args = vec![
-            "app-server".to_owned(),
-            "--listen".to_owned(),
-            endpoint.clone(),
-        ];
+        let args = build_app_server_process_args(&endpoint);
         (program, args)
     } else {
-        let quoted_endpoint = quote_shell(&endpoint);
+        let app_server_cmd = build_app_server_shell_command(&endpoint);
         let launch_cmd = if let Some(codex_bin) = config.codex_bin.as_deref() {
             let codex_dir = Path::new(codex_bin)
                 .parent()
@@ -581,30 +580,26 @@ fn spawn_local_runtime(config: &LocalDeviceConfig) -> Result<ConnectionRuntime, 
                 .map(str::to_owned);
             if let Some(dir) = codex_dir {
                 format!(
-                    "PATH={}:$PATH {} app-server --listen {}",
+                    "PATH={}:$PATH {} {}",
                     quote_shell(&dir),
                     quote_shell(codex_bin),
-                    quoted_endpoint
+                    app_server_cmd
                 )
             } else {
-                format!(
-                    "{} app-server --listen {}",
-                    quote_shell(codex_bin),
-                    quoted_endpoint
-                )
+                format!("{} {}", quote_shell(codex_bin), app_server_cmd)
             }
         } else {
             // Finder-launched macOS apps do not inherit shell PATH; load nvm when needed.
             format!(
-                "if command -v codex >/dev/null 2>&1; then codex app-server --listen {listen}; \
-elif [ -x /opt/homebrew/bin/codex ]; then PATH=/opt/homebrew/bin:$PATH /opt/homebrew/bin/codex app-server --listen {listen}; \
-elif [ -x /usr/local/bin/codex ]; then PATH=/usr/local/bin:$PATH /usr/local/bin/codex app-server --listen {listen}; \
-elif [ -x \"$HOME/.local/bin/codex\" ]; then PATH=\"$HOME/.local/bin:$PATH\" \"$HOME/.local/bin/codex\" app-server --listen {listen}; \
-elif command -v fnm >/dev/null 2>&1 && eval \"$(fnm env --shell bash)\" >/dev/null 2>&1 && command -v codex >/dev/null 2>&1; then codex app-server --listen {listen}; \
-elif [ -d \"$HOME/.local/state/fnm_multishells\" ] && latest_fnm_codex=$(ls -t \"$HOME\"/.local/state/fnm_multishells/*/bin/codex 2>/dev/null | head -n 1) && [ -n \"$latest_fnm_codex\" ]; then PATH=\"$(dirname \"$latest_fnm_codex\"):$PATH\" \"$latest_fnm_codex\" app-server --listen {listen}; \
-elif [ -s \"$HOME/.nvm/nvm.sh\" ] && . \"$HOME/.nvm/nvm.sh\" >/dev/null 2>&1 && command -v codex >/dev/null 2>&1; then codex app-server --listen {listen}; \
+                "if command -v codex >/dev/null 2>&1; then codex {cmd}; \
+elif [ -x /opt/homebrew/bin/codex ]; then PATH=/opt/homebrew/bin:$PATH /opt/homebrew/bin/codex {cmd}; \
+elif [ -x /usr/local/bin/codex ]; then PATH=/usr/local/bin:$PATH /usr/local/bin/codex {cmd}; \
+elif [ -x \"$HOME/.local/bin/codex\" ]; then PATH=\"$HOME/.local/bin:$PATH\" \"$HOME/.local/bin/codex\" {cmd}; \
+elif command -v fnm >/dev/null 2>&1 && eval \"$(fnm env --shell bash)\" >/dev/null 2>&1 && command -v codex >/dev/null 2>&1; then codex {cmd}; \
+elif [ -d \"$HOME/.local/state/fnm_multishells\" ] && latest_fnm_codex=$(ls -t \"$HOME\"/.local/state/fnm_multishells/*/bin/codex 2>/dev/null | head -n 1) && [ -n \"$latest_fnm_codex\" ]; then PATH=\"$(dirname \"$latest_fnm_codex\"):$PATH\" \"$latest_fnm_codex\" {cmd}; \
+elif [ -s \"$HOME/.nvm/nvm.sh\" ] && . \"$HOME/.nvm/nvm.sh\" >/dev/null 2>&1 && command -v codex >/dev/null 2>&1; then codex {cmd}; \
 else echo 'codex binary not found on PATH/homebrew/local/fnm/nvm; set explicit local codex path in device config' >&2; exit 127; fi",
-                listen = quoted_endpoint
+                cmd = app_server_cmd
             )
         };
         ("bash".to_owned(), vec!["-lc".to_owned(), launch_cmd])
@@ -691,7 +686,7 @@ fn spawn_ssh_runtime(config: &SshDeviceConfig) -> Result<ConnectionRuntime, AppS
     }
 
     let listen_uri = format!("ws://127.0.0.1:{remote_port}");
-    let quoted_listen_uri = quote_shell(&listen_uri);
+    let app_server_cmd = build_app_server_shell_command(&listen_uri);
     let launch_cmd = if let Some(codex_bin) = config.codex_bin.as_deref() {
         let codex_dir = Path::new(codex_bin)
             .parent()
@@ -699,29 +694,25 @@ fn spawn_ssh_runtime(config: &SshDeviceConfig) -> Result<ConnectionRuntime, AppS
             .map(str::to_owned);
         if let Some(dir) = codex_dir {
             format!(
-                "PATH={}:$PATH {} app-server --listen {}",
+                "PATH={}:$PATH {} {}",
                 quote_shell(&dir),
                 quote_shell(codex_bin),
-                quoted_listen_uri
+                app_server_cmd
             )
         } else {
-            format!(
-                "{} app-server --listen {}",
-                quote_shell(codex_bin),
-                quoted_listen_uri
-            )
+            format!("{} {}", quote_shell(codex_bin), app_server_cmd)
         }
     } else {
         format!(
-            "if command -v codex >/dev/null 2>&1; then codex app-server --listen {listen}; \
-elif [ -x /opt/homebrew/bin/codex ]; then PATH=/opt/homebrew/bin:$PATH /opt/homebrew/bin/codex app-server --listen {listen}; \
-elif [ -x /usr/local/bin/codex ]; then PATH=/usr/local/bin:$PATH /usr/local/bin/codex app-server --listen {listen}; \
-elif [ -x \"$HOME/.local/bin/codex\" ]; then PATH=\"$HOME/.local/bin:$PATH\" \"$HOME/.local/bin/codex\" app-server --listen {listen}; \
-elif command -v fnm >/dev/null 2>&1 && eval \"$(fnm env --shell bash)\" >/dev/null 2>&1 && command -v codex >/dev/null 2>&1; then codex app-server --listen {listen}; \
-elif [ -d \"$HOME/.local/state/fnm_multishells\" ] && latest_fnm_codex=$(ls -t \"$HOME\"/.local/state/fnm_multishells/*/bin/codex 2>/dev/null | head -n 1) && [ -n \"$latest_fnm_codex\" ]; then PATH=\"$(dirname \"$latest_fnm_codex\"):$PATH\" \"$latest_fnm_codex\" app-server --listen {listen}; \
-elif [ -s \"$HOME/.nvm/nvm.sh\" ] && . \"$HOME/.nvm/nvm.sh\" >/dev/null 2>&1 && command -v codex >/dev/null 2>&1; then codex app-server --listen {listen}; \
+            "if command -v codex >/dev/null 2>&1; then codex {cmd}; \
+elif [ -x /opt/homebrew/bin/codex ]; then PATH=/opt/homebrew/bin:$PATH /opt/homebrew/bin/codex {cmd}; \
+elif [ -x /usr/local/bin/codex ]; then PATH=/usr/local/bin:$PATH /usr/local/bin/codex {cmd}; \
+elif [ -x \"$HOME/.local/bin/codex\" ]; then PATH=\"$HOME/.local/bin:$PATH\" \"$HOME/.local/bin/codex\" {cmd}; \
+elif command -v fnm >/dev/null 2>&1 && eval \"$(fnm env --shell bash)\" >/dev/null 2>&1 && command -v codex >/dev/null 2>&1; then codex {cmd}; \
+elif [ -d \"$HOME/.local/state/fnm_multishells\" ] && latest_fnm_codex=$(ls -t \"$HOME\"/.local/state/fnm_multishells/*/bin/codex 2>/dev/null | head -n 1) && [ -n \"$latest_fnm_codex\" ]; then PATH=\"$(dirname \"$latest_fnm_codex\"):$PATH\" \"$latest_fnm_codex\" {cmd}; \
+elif [ -s \"$HOME/.nvm/nvm.sh\" ] && . \"$HOME/.nvm/nvm.sh\" >/dev/null 2>&1 && command -v codex >/dev/null 2>&1; then codex {cmd}; \
 else echo 'codex binary not found on PATH/homebrew/local/fnm/nvm; set explicit codex path in device config' >&2; exit 127; fi",
-            listen = quoted_listen_uri
+            cmd = app_server_cmd
         )
     };
     let stale_cleanup_cmd = format!(
@@ -952,4 +943,25 @@ fn quote_shell(value: &str) -> String {
 
     let escaped = value.replace('\'', "'\\''");
     format!("'{escaped}'")
+}
+
+fn build_app_server_process_args(listen_uri: &str) -> Vec<String> {
+    vec![
+        "app-server".to_owned(),
+        "-c".to_owned(),
+        DEFAULT_APP_SERVER_APPROVAL_CONFIG.to_owned(),
+        "-c".to_owned(),
+        DEFAULT_APP_SERVER_SANDBOX_CONFIG.to_owned(),
+        "--listen".to_owned(),
+        listen_uri.to_owned(),
+    ]
+}
+
+fn build_app_server_shell_command(listen_uri: &str) -> String {
+    format!(
+        "app-server -c {} -c {} --listen {}",
+        quote_shell(DEFAULT_APP_SERVER_APPROVAL_CONFIG),
+        quote_shell(DEFAULT_APP_SERVER_SANDBOX_CONFIG),
+        quote_shell(listen_uri)
+    )
 }
