@@ -57,6 +57,104 @@ const rolloutMessagesFromExistingSessionFixture = (): ChatMessage[] =>
     )
     .filter((message): message is ChatMessage => message !== null);
 
+const legacyExistingSessionMessagesWithoutChronologySource = (): ChatMessage[] => {
+  const threadReadMessages = existingSessionChronologyFixture.threadReadSnapshot.messages;
+  if (!Array.isArray(threadReadMessages)) {
+    return [];
+  }
+
+  return threadReadMessages.flatMap((value, index) => {
+    if (!value || typeof value !== "object") {
+      return [];
+    }
+    const entry = value as Record<string, unknown>;
+    const id = typeof entry.id === "string" ? entry.id : "";
+    const role = entry.role;
+    const content = typeof entry.content === "string" ? entry.content : "";
+    if (!id || (role !== "user" && role !== "assistant" && role !== "system")) {
+      return [];
+    }
+    return [
+      buildMessage({
+        id,
+        threadId: existingSessionChronologyFixture.threadId,
+        key: `device-1::${existingSessionChronologyFixture.threadId}`,
+        role,
+        content,
+        createdAt: "2026-01-10T16:01:40.000Z",
+        timelineOrder: index
+      })
+    ];
+  });
+};
+
+const turnReloadMessagesFromExistingSessionFixture = (): ChatMessage[] =>
+  codexApiTest.parseMessagesFromThread(
+    "device-1",
+    existingSessionChronologyFixture.threadId,
+    {
+      createdAt: "2026-01-10T16:01:40.000Z",
+      turns: [
+        {
+          createdAt: "2026-01-10T16:01:40.000Z",
+          messages: [
+            {
+              id: "item-1",
+              role: "user",
+              content:
+                "Set up a GitHub Action that emails me whenever tracked repositories receive new commits."
+            },
+            {
+              id: "item-2",
+              role: "assistant",
+              content:
+                "I’m inspecting the empty repository first, then I’ll scaffold the workflow and config files."
+            }
+          ]
+        },
+        {
+          createdAt: "2026-01-10T16:01:40.000Z",
+          messages: [
+            {
+              id: "item-3",
+              role: "user",
+              content: "Track pushes on the main and release branches."
+            },
+            {
+              id: "item-4",
+              role: "assistant",
+              content:
+                "I added a tracked-repositories config file so the workflow knows which branches to watch."
+            }
+          ]
+        },
+        {
+          createdAt: "2026-01-10T16:01:40.000Z",
+          messages: [
+            {
+              id: "item-10",
+              role: "assistant",
+              content:
+                "I found the workflow syntax issue and corrected the invalid trigger configuration."
+            },
+            {
+              id: "item-11",
+              role: "assistant",
+              content:
+                "The repository now sends email notifications for configured branches and includes setup notes."
+            }
+          ]
+        }
+      ]
+    }
+  );
+
+const rolloutMessagesWithCollapsedTimestampsFromExistingSessionFixture = (): ChatMessage[] =>
+  rolloutMessagesFromExistingSessionFixture().map((message) => ({
+    ...message,
+    createdAt: "2026-01-10T16:01:40.000Z"
+  }));
+
 describe("useAppStore message upsert behavior", () => {
   it("replaces optimistic user message when server acknowledgement arrives", () => {
     const optimistic = buildMessage({
@@ -772,6 +870,41 @@ describe("useAppStore message upsert behavior", () => {
       "2026-01-10T15:09:41.901Z",
       "2026-01-10T15:10:18.044Z"
     ]);
+  });
+
+  it("re-anchors legacy persisted snapshots missing chronologySource when an authoritative turn reload arrives", () => {
+    const legacy = legacyExistingSessionMessagesWithoutChronologySource();
+    const authoritativeReload = turnReloadMessagesFromExistingSessionFixture();
+    const repaired = __TEST_ONLY__.mergeSnapshotMessages(legacy, authoritativeReload);
+
+    expect(messageRoleIdOrder(legacy)).toEqual(
+      existingSessionChronologyFixture.expectedLexicographicSnapshotOrder
+    );
+    expect(messageRoleIdOrder(authoritativeReload)).toEqual(
+      existingSessionChronologyFixture.expectedNumericSnapshotOrder
+    );
+    expect(messageRoleIdOrder(repaired)).toEqual(
+      existingSessionChronologyFixture.expectedNumericSnapshotOrder
+    );
+    expect(repaired.map((message) => message.timelineOrder)).toEqual([0, 1, 2, 3, 4, 5]);
+  });
+
+  it("re-anchors legacy persisted snapshots missing chronologySource when rollout enrichment keeps collapsed timestamps", () => {
+    const legacy = legacyExistingSessionMessagesWithoutChronologySource();
+    const collapsedRollout =
+      rolloutMessagesWithCollapsedTimestampsFromExistingSessionFixture();
+    const repaired = __TEST_ONLY__.mergeRolloutEnrichmentMessages(
+      legacy,
+      collapsedRollout
+    );
+
+    expect(messageRoleIdOrder(legacy)).toEqual(
+      existingSessionChronologyFixture.expectedLexicographicSnapshotOrder
+    );
+    expect(messageRoleIdOrder(repaired)).toEqual(
+      existingSessionChronologyFixture.expectedNumericSnapshotOrder
+    );
+    expect(repaired.map((message) => message.timelineOrder)).toEqual([0, 1, 2, 3, 4, 5]);
   });
 
   it("replays mixed live+snapshot+rollout convergence from the shared chronology corpus", () => {
