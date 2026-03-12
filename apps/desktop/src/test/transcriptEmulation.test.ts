@@ -4,6 +4,14 @@ import { __TEST_ONLY__ } from "../state/useAppStore";
 import { resolveVisibleMessageWindow } from "../components/chatWindow";
 import { __TEST_ONLY__ as codexApiTest } from "../services/codexApi";
 import type { ChatMessage } from "../domain/types";
+import {
+  chronologyReplayFixtureById,
+  type ExpectedToolBubble
+} from "../../../../../codex-app-electron/src/renderer/src/test/chronologyReplayFixtures";
+import {
+  applyChronologyReplayFixture,
+  messageRoleIdOrder
+} from "./chronologyReplayHarness";
 
 const applyParsedMessage = (
   messages: ChatMessage[],
@@ -17,6 +25,25 @@ const applyParsedMessage = (
     messages,
     __TEST_ONLY__.normalizeLiveNotificationMessage(messages, parsed.message)
   );
+};
+
+const expectToolBubblesToMatch = (
+  messages: ChatMessage[],
+  expectedBubbles: ExpectedToolBubble[]
+): void => {
+  const toolMessages = messages.filter((message) => message.eventType === "tool_call");
+  expect(toolMessages).toHaveLength(expectedBubbles.length);
+
+  expectedBubbles.forEach((expectedBubble, index) => {
+    const actual = toolMessages[index];
+    expect(actual?.toolCall?.name).toBe(expectedBubble.name);
+    if (expectedBubble.inputIncludes) {
+      expect(actual.toolCall?.input).toContain(expectedBubble.inputIncludes);
+    }
+    if (expectedBubble.outputIncludes) {
+      expect(actual.toolCall?.output).toContain(expectedBubble.outputIncludes);
+    }
+  });
 };
 
 describe("frontend transcript emulation", () => {
@@ -980,5 +1007,21 @@ describe("frontend transcript emulation", () => {
     expect(initialWindow.hiddenMessageCount).toBe(5);
     expect(expandedWindow.hiddenMessageCount).toBe(0);
     expect(expandedWindow.visibleMessages).toHaveLength(45);
+  });
+
+  it("replays mixed live + snapshot + rollout convergence from the shared fixture corpus", () => {
+    const fixture = chronologyReplayFixtureById["live-snapshot-rollout-tool-convergence"];
+    const messages = applyChronologyReplayFixture(fixture);
+
+    expect(messageRoleIdOrder(messages)).toEqual(fixture.expectedOrder);
+    expectToolBubblesToMatch(messages, fixture.expectedToolBubbles);
+  });
+
+  it("does not collapse distinct turns when the upstream call_id is reused", () => {
+    const fixture = chronologyReplayFixtureById["reused-call-id-across-turns"];
+    const messages = applyChronologyReplayFixture(fixture);
+
+    expect(messageRoleIdOrder(messages)).toEqual(fixture.expectedOrder);
+    expectToolBubblesToMatch(messages, fixture.expectedToolBubbles);
   });
 });

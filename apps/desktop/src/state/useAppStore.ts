@@ -45,6 +45,10 @@ import {
   parseThreadModelNotification,
   parseThreadTokenUsageNotification
 } from "../services/eventParser";
+import {
+  sortMessagesAscending,
+  toolCallCompletenessScore
+} from "../services/messageChronology";
 import { computeCostUsdFromUsage, resolveModelPricing } from "../services/modelPricing";
 import { toSearchIndexThreadPayload } from "../services/searchIndexPayload";
 import {
@@ -325,7 +329,12 @@ const toolCallSignature = (message: ChatMessage): string =>
   ].join("|");
 
 const messageIdentityKey = (message: ChatMessage): string =>
-  [message.id, message.role, message.eventType ?? ""].join("::");
+  [
+    message.id,
+    message.role,
+    message.eventType ?? "",
+    ...(message.eventType === "tool_call" ? [message.createdAt] : [])
+  ].join("::");
 
 const shouldPreserveEarliestUserTimestamp = (
   current: ChatMessage,
@@ -617,7 +626,7 @@ const isSameLogicalMessage = (
   }
 
   if (current.eventType === "tool_call" && incoming.eventType === "tool_call") {
-    return true;
+    return isLikelySameToolCall(current, incoming);
   }
 
   if (current.createdAt === incoming.createdAt) {
@@ -655,6 +664,81 @@ const isSameLogicalMessage = (
     currentContent.startsWith(incomingContent) ||
     incomingContent.startsWith(currentContent)
   );
+};
+
+const normalizeToolField = (value: string | undefined): string =>
+  normalizeMessageText(value ?? "");
+
+const areCompatibleToolFields = (
+  current: string | undefined,
+  incoming: string | undefined
+): boolean => {
+  const currentNormalized = normalizeToolField(current);
+  const incomingNormalized = normalizeToolField(incoming);
+  if (currentNormalized.length === 0 || incomingNormalized.length === 0) {
+    return true;
+  }
+
+  return (
+    currentNormalized === incomingNormalized ||
+    currentNormalized.includes(incomingNormalized) ||
+    incomingNormalized.includes(currentNormalized)
+  );
+};
+
+const isTerminalToolMessage = (message: ChatMessage): boolean =>
+  message.toolCall?.status === "completed" ||
+  message.toolCall?.status === "failed" ||
+  Boolean(message.toolCall?.output?.trim().length);
+
+const isLikelySameToolCall = (
+  current: ChatMessage,
+  incoming: ChatMessage
+): boolean => {
+  if (!current.toolCall || !incoming.toolCall) {
+    return current.createdAt === incoming.createdAt;
+  }
+
+  const currentName = current.toolCall.name.trim();
+  const incomingName = incoming.toolCall.name.trim();
+  if (
+    currentName.length > 0 &&
+    incomingName.length > 0 &&
+    !isGenericToolName(currentName) &&
+    !isGenericToolName(incomingName) &&
+    currentName !== incomingName
+  ) {
+    return false;
+  }
+
+  if (
+    !areCompatibleToolFields(current.toolCall.input, incoming.toolCall.input) ||
+    !areCompatibleToolFields(current.toolCall.output, incoming.toolCall.output)
+  ) {
+    return false;
+  }
+
+  const currentMs = Date.parse(current.createdAt);
+  const incomingMs = Date.parse(incoming.createdAt);
+  if (Number.isNaN(currentMs) || Number.isNaN(incomingMs)) {
+    return true;
+  }
+
+  const currentTerminal = isTerminalToolMessage(current);
+  const incomingTerminal = isTerminalToolMessage(incoming);
+  if (currentTerminal && !incomingTerminal) {
+    return incomingMs < currentMs || incomingMs - currentMs <= STREAMING_MERGE_WINDOW_MS;
+  }
+
+  if (!currentTerminal && incomingTerminal) {
+    return true;
+  }
+
+  if (!currentTerminal && !incomingTerminal) {
+    return Math.abs(currentMs - incomingMs) <= STREAMING_MERGE_WINDOW_MS;
+  }
+
+  return areServerTimestampsClose(current.createdAt, incoming.createdAt);
 };
 
 const pickLatestTimestamp = (a: string, b: string): string => {
@@ -742,35 +826,6 @@ const normalizeLiveNotificationMessage = (
   };
 };
 
-const sortMessagesAscending = (a: ChatMessage, b: ChatMessage): number => {
-  const aMs = Date.parse(a.createdAt);
-  const bMs = Date.parse(b.createdAt);
-  if (Number.isNaN(aMs) && Number.isNaN(bMs)) {
-    return compareTimelineOrder(a, b);
-  }
-  if (Number.isNaN(aMs)) {
-    return 1;
-  }
-  if (Number.isNaN(bMs)) {
-    return -1;
-  }
-  if (aMs === bMs) {
-    return compareTimelineOrder(a, b);
-  }
-  return aMs - bMs;
-};
-
-const compareTimelineOrder = (a: ChatMessage, b: ChatMessage): number => {
-  if (
-    typeof a.timelineOrder === "number" &&
-    typeof b.timelineOrder === "number" &&
-    a.timelineOrder !== b.timelineOrder
-  ) {
-    return a.timelineOrder - b.timelineOrder;
-  }
-  return 0;
-};
-
 const preferCanonicalMessage = (
   current: ChatMessage,
   incoming: ChatMessage
@@ -815,18 +870,6 @@ const preferCanonicalMessage = (
     pickLatestTimestamp(current.createdAt, incoming.createdAt) === incoming.createdAt
       ? incoming
       : current
-  );
-};
-
-const toolCallCompletenessScore = (message: ChatMessage): number => {
-  if (!message.toolCall) {
-    return 0;
-  }
-  return (
-    (message.toolCall.name.trim().length > 0 ? 1 : 0) +
-    (message.toolCall.input?.trim().length ? 1 : 0) +
-    (message.toolCall.output?.trim().length ? 2 : 0) +
-    (message.toolCall.status === "completed" || message.toolCall.status === "failed" ? 1 : 0)
   );
 };
 

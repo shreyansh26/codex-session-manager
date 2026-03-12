@@ -9,6 +9,8 @@ import {
   parseLsDirectoryEntries
 } from "../services/codexApi";
 import type { ChatImageAttachment, ChatMessage, ComposerSubmission } from "../domain/types";
+import { parseRpcNotification } from "../services/eventParser";
+import { chronologyReplayFixtureById } from "../../../../../codex-app-electron/src/renderer/src/test/chronologyReplayFixtures";
 
 const sampleImage = (url: string): ChatImageAttachment => ({
   id: "img-1",
@@ -280,6 +282,53 @@ describe("parseToolMessagesFromRolloutJsonl", () => {
     expect(messages[0].toolCall?.input).toContain(
       '"query": "site:investing.com Reuters March 8 2026 Gulf attacks Iran war"'
     );
+  });
+});
+
+describe("shared chronology replay fixtures", () => {
+  it("preserves explicit tool-call structure for equal-timestamp snapshot items", () => {
+    const fixture = chronologyReplayFixtureById["equal-timestamps-timeline-order"];
+    const snapshotStep = fixture.steps.find((step) => step.source === "thread_read");
+    expect(snapshotStep?.source).toBe("thread_read");
+    if (!snapshotStep || snapshotStep.source !== "thread_read") {
+      throw new Error("Missing equal timestamp snapshot step");
+    }
+
+    const messages = codexApiTest.parseMessagesFromThread(
+      "device-1",
+      fixture.threadId,
+      snapshotStep.snapshot
+    );
+
+    expect(messages[2]).toMatchObject({
+      id: "tool-equal",
+      role: "tool",
+      eventType: "tool_call",
+      toolCall: {
+        name: "exec_command",
+        input: "pwd",
+        status: "completed"
+      }
+    });
+  });
+
+  it("keeps reused call_id parser identity stable across turns under collision pressure", () => {
+    const fixture = chronologyReplayFixtureById["reused-call-id-across-turns"];
+    const parsedToolIds = fixture.steps
+      .filter((step) => step.source === "live")
+      .map((step) =>
+        step.source === "live" ? parseRpcNotification("device-1", step.notification) : null
+      )
+      .filter((value): value is NonNullable<typeof value> => value !== null)
+      .filter((value) => value.message.eventType === "tool_call")
+      .map((value) => value.message.id);
+
+    expect(parsedToolIds).toEqual([
+      "call-reused",
+      "call-reused",
+      "call-reused",
+      "call-reused"
+    ]);
   });
 });
 

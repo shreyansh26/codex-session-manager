@@ -6,6 +6,26 @@ import {
   parseThreadModelNotification,
   parseThreadTokenUsageNotification
 } from "../services/eventParser";
+import { chronologyReplayFixtureById } from "../../../../../codex-app-electron/src/renderer/src/test/chronologyReplayFixtures";
+
+const pickLiveNotification = (
+  fixtureId: string,
+  labelPrefix: string
+): Parameters<typeof parseRpcNotification>[1] => {
+  const fixture = chronologyReplayFixtureById[fixtureId];
+  if (!fixture) {
+    throw new Error(`Unknown chronology fixture: ${fixtureId}`);
+  }
+
+  const step = fixture.steps.find(
+    (candidate) => candidate.source === "live" && candidate.label.startsWith(labelPrefix)
+  );
+  if (!step || step.source !== "live") {
+    throw new Error(`Missing live step ${labelPrefix} in fixture ${fixtureId}`);
+  }
+
+  return step.notification;
+};
 
 describe("parseRpcNotification", () => {
   it("parses item/completed notification into chat message", () => {
@@ -272,6 +292,7 @@ describe("parseRpcNotification", () => {
       method: "codex/event",
       params: {
         threadId: "thread-live-tool",
+        timestamp: "2026-03-08T08:10:20.101Z",
         msg: {
           type: "function_call",
           name: "exec_command",
@@ -306,6 +327,7 @@ describe("parseRpcNotification", () => {
       params: {
         threadId: "thread-live-tool",
         id: "turn-envelope-1",
+        timestamp: "2026-03-08T08:10:20.202Z",
         msg: {
           type: "response_item",
           payload: {
@@ -342,6 +364,7 @@ describe("parseRpcNotification", () => {
       method: "codex/event",
       params: {
         threadId: "thread-live-tool",
+        timestamp: "2026-03-08T08:10:20.303Z",
         msg: {
           type: "response_item",
           payload: {
@@ -384,6 +407,7 @@ describe("parseRpcNotification", () => {
       params: {
         conversationId: "thread-live-tool",
         id: "turn-envelope-2",
+        timestamp: "2026-03-08T08:10:20.404Z",
         msg: {
           type: "response_item",
           payload: {
@@ -482,6 +506,74 @@ describe("parseRpcNotification", () => {
         eventType: "tool_call"
       }
     });
+  });
+
+  it("keeps fallback tool identity stable when call_id is missing", () => {
+    const baseNotification = structuredClone(
+      pickLiveNotification("output-before-call-record", "tool-start:")
+    ) as unknown as Record<string, unknown>;
+
+    const params = baseNotification.params as Record<string, unknown>;
+    const msg = params.msg as Record<string, unknown>;
+    const payload = msg.payload as Record<string, unknown>;
+    delete payload.call_id;
+
+    const replayNotification = structuredClone(baseNotification) as Record<string, unknown>;
+    (replayNotification.params as Record<string, unknown>).timestamp =
+      "2026-03-08T08:20:11.000Z";
+
+    const first = parseRpcNotification(
+      "device-chronology",
+      baseNotification as unknown as Parameters<typeof parseRpcNotification>[1]
+    );
+    const replay = parseRpcNotification(
+      "device-chronology",
+      replayNotification as unknown as Parameters<typeof parseRpcNotification>[1]
+    );
+
+    expect(first?.message.id).toBe(replay?.message.id);
+  });
+
+  it("falls back to nested wrapped createdAt when outer wrapped timestamp is invalid", () => {
+    const notification = structuredClone(
+      pickLiveNotification("live-snapshot-rollout-tool-convergence", "tool-start:")
+    ) as unknown as Record<string, unknown>;
+
+    const params = notification.params as Record<string, unknown>;
+    params.timestamp = "not-a-real-timestamp";
+
+    const parsed = parseRpcNotification(
+      "device-chronology",
+      notification as unknown as Parameters<typeof parseRpcNotification>[1]
+    );
+
+    expect(parsed?.message.createdAt).toBe("2026-03-08T08:09:50.000Z");
+  });
+
+  it("returns null for wrapped tool events missing all timestamp candidates", () => {
+    const notification = structuredClone(
+      pickLiveNotification("live-snapshot-rollout-tool-convergence", "tool-start:")
+    ) as unknown as Record<string, unknown>;
+
+    const params = notification.params as Record<string, unknown>;
+    delete params.timestamp;
+    const msg = params.msg as Record<string, unknown>;
+    delete msg.createdAt;
+
+    const parsed = parseRpcNotification(
+      "device-chronology",
+      notification as unknown as Parameters<typeof parseRpcNotification>[1]
+    );
+
+    expect(parsed).toBeNull();
+  });
+
+  it("does not treat call_id metadata as tool input for output-only wrapped payloads", () => {
+    const notification = pickLiveNotification("output-before-call-record", "tool-output:");
+    const parsed = parseRpcNotification("device-chronology", notification);
+
+    expect(parsed?.message.toolCall?.input).toBeUndefined();
+    expect(parsed?.message.toolCall?.output).toContain("Process exited with code 0");
   });
 });
 

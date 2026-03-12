@@ -13,7 +13,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "tauri": "tauri"
+    "tauri:preflight": "node ./scripts/ensure-relocatable-tauri-target.mjs",
+    "tauri": "npm run tauri:preflight && tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

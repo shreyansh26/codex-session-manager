@@ -184,30 +184,34 @@ export const parseRpcNotification = (
       return null;
     }
 
-    const createdAtRaw =
+    const createdAtFallbackAllowed =
+      method !== "codex/event" && !method.startsWith("codex/event/");
+    const createdAt =
       pickNotificationTimestamp(activityRecord, rawActivityRecord, params) ??
-      new Date().toISOString();
-    const createdAt = normalizeTimestamp(createdAtRaw) ?? new Date().toISOString();
+      (createdAtFallbackAllowed ? new Date().toISOString() : null);
+    if (!createdAt) {
+      return null;
+    }
     const baseId =
       pickString(activityRecord, [
         "id",
         "itemId",
         "eventId",
         "event_id",
-        "turnId",
-        "turn_id",
         "call_id",
-        "callId"
+        "callId",
+        "turnId",
+        "turn_id"
       ]) ??
       pickString(rawActivityRecord, [
         "id",
         "itemId",
         "eventId",
         "event_id",
-        "turnId",
-        "turn_id",
         "call_id",
-        "callId"
+        "callId",
+        "turnId",
+        "turn_id"
       ]) ??
       pickString(params, ["id", "eventId", "turnId"]) ??
       buildStableMessageId({
@@ -531,8 +535,18 @@ export const extractItemMessagePayload = (
   const rawContent = extractText(item);
   const preserveRawChunk = shouldPreserveRawChunk(method, role);
   const content = preserveRawChunk ? rawContent : rawContent.trim();
-  const toolCall = extractStructuredToolCall(item, method, role, content);
-  const eventType = toolCall ? "tool_call" : inferEventType(item, method, role);
+  const declaredToolCall = extractDeclaredToolCall(item);
+  const toolCall = declaredToolCall ?? extractStructuredToolCall(item, method, role, content);
+  const declaredEventType = pickString(item, ["eventType"]);
+  const normalizedDeclaredEventType =
+    declaredEventType === "reasoning" ||
+    declaredEventType === "activity" ||
+    declaredEventType === "tool_call"
+      ? declaredEventType
+      : undefined;
+  const eventType = toolCall
+    ? "tool_call"
+    : normalizedDeclaredEventType ?? inferEventType(item, method, role);
 
   if (toolCall) {
     return {
@@ -667,8 +681,12 @@ const pickNotificationTimestamp = (
   for (const keys of fieldPriority) {
     for (const record of records) {
       const timestamp = pickString(record ?? null, keys) ?? null;
-      if (timestamp) {
-        return timestamp;
+      if (!timestamp) {
+        continue;
+      }
+      const normalized = normalizeTimestamp(timestamp);
+      if (normalized) {
+        return normalized;
       }
     }
   }
@@ -778,6 +796,38 @@ const formatWebSearchActionInput = (value: unknown): string | undefined => {
       ...(queries.length > 0 ? { queries } : {})
     }) ?? undefined
   );
+};
+
+const extractDeclaredToolCall = (
+  item: Record<string, unknown>
+): ChatMessage["toolCall"] | undefined => {
+  const record = asRecord(item.toolCall);
+  if (!record) {
+    return undefined;
+  }
+
+  const name =
+    pickString(record, ["name", "toolName", "tool_name"]) ??
+    pickString(item, ["name", "toolName", "tool_name"]) ??
+    "tool";
+  const input =
+    (typeof record.input === "string" ? record.input : null) ??
+    formatToolPayload(record.input, { preferCommand: true }) ??
+    undefined;
+  const output =
+    (typeof record.output === "string" ? record.output : null) ??
+    formatToolOutputPayload(record.output) ??
+    undefined;
+  const status = normalizeToolCallStatus(
+    pickString(record, ["status", "state"]) ?? undefined
+  );
+
+  return {
+    name,
+    ...(input ? { input } : {}),
+    ...(output ? { output } : {}),
+    ...(status ? { status } : {})
+  };
 };
 
 const extractStructuredToolCall = (
@@ -1011,8 +1061,15 @@ const extractToolInput = (item: Record<string, unknown>): string | null => {
     "message_id",
     "itemId",
     "item_id",
+    "call_id",
+    "callId",
+    "turnId",
+    "turn_id",
     "role",
     "author",
+    "name",
+    "toolName",
+    "tool_name",
     "type",
     "itemType",
     "status",
@@ -1110,6 +1167,39 @@ const inferToolCallStatus = (
     return "running";
   }
   return output ? "completed" : undefined;
+};
+
+const normalizeToolCallStatus = (
+  value: string | undefined
+): "running" | "completed" | "failed" | undefined => {
+  if (!value) {
+    return undefined;
+  }
+
+  const normalized = value.toLowerCase();
+  if (
+    normalized.includes("fail") ||
+    normalized.includes("error") ||
+    normalized.includes("reject")
+  ) {
+    return "failed";
+  }
+  if (
+    normalized.includes("complete") ||
+    normalized.includes("success") ||
+    normalized.includes("done")
+  ) {
+    return "completed";
+  }
+  if (
+    normalized.includes("start") ||
+    normalized.includes("run") ||
+    normalized.includes("progress") ||
+    normalized.includes("pending")
+  ) {
+    return "running";
+  }
+  return undefined;
 };
 
 const buildToolCallContent = (
@@ -1478,7 +1568,7 @@ export const buildStableMessageId = (params: {
     params.eventType ?? "message",
     params.method.replaceAll("/", "-"),
     fingerprint,
-    params.createdAt
+    ...(params.payload.toolCall ? [] : [params.createdAt])
   ].join("::");
 };
 

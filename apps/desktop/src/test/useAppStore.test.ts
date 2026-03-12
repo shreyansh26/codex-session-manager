@@ -5,6 +5,14 @@ import type {
   ThreadTokenUsageState
 } from "../domain/types";
 import { __TEST_ONLY__ } from "../state/useAppStore";
+import {
+  chronologyReplayFixtureById,
+  type ExpectedToolBubble
+} from "../../../../../codex-app-electron/src/renderer/src/test/chronologyReplayFixtures";
+import {
+  applyChronologyReplayFixture,
+  messageRoleIdOrder
+} from "./chronologyReplayHarness";
 
 const buildMessage = (partial: Partial<ChatMessage>): ChatMessage => ({
   id: "message-id",
@@ -16,6 +24,25 @@ const buildMessage = (partial: Partial<ChatMessage>): ChatMessage => ({
   createdAt: "2026-03-02T12:00:00.000Z",
   ...partial
 });
+
+const expectToolBubblesToMatch = (
+  messages: ChatMessage[],
+  expectedBubbles: ExpectedToolBubble[]
+): void => {
+  const toolMessages = messages.filter((message) => message.eventType === "tool_call");
+  expect(toolMessages).toHaveLength(expectedBubbles.length);
+
+  expectedBubbles.forEach((expectedBubble, index) => {
+    const actual = toolMessages[index];
+    expect(actual?.toolCall?.name).toBe(expectedBubble.name);
+    if (expectedBubble.inputIncludes) {
+      expect(actual.toolCall?.input).toContain(expectedBubble.inputIncludes);
+    }
+    if (expectedBubble.outputIncludes) {
+      expect(actual.toolCall?.output).toContain(expectedBubble.outputIncludes);
+    }
+  });
+};
 
 describe("useAppStore message upsert behavior", () => {
   it("replaces optimistic user message when server acknowledgement arrives", () => {
@@ -697,6 +724,22 @@ describe("useAppStore message upsert behavior", () => {
       ["call-live-tool", "2026-03-08T09:39:28.747Z"],
       ["item-3", "2026-03-08T09:39:40.754Z"]
     ]);
+  });
+
+  it("replays mixed live+snapshot+rollout convergence from the shared chronology corpus", () => {
+    const fixture = chronologyReplayFixtureById["live-snapshot-rollout-tool-convergence"];
+    const messages = applyChronologyReplayFixture(fixture);
+
+    expect(messageRoleIdOrder(messages)).toEqual(fixture.expectedOrder);
+    expectToolBubblesToMatch(messages, fixture.expectedToolBubbles);
+  });
+
+  it("preserves distinct tool bubbles when the same upstream call_id is reused across turns", () => {
+    const fixture = chronologyReplayFixtureById["reused-call-id-across-turns"];
+    const messages = applyChronologyReplayFixture(fixture);
+
+    expect(messageRoleIdOrder(messages)).toEqual(fixture.expectedOrder);
+    expectToolBubblesToMatch(messages, fixture.expectedToolBubbles);
   });
 });
 

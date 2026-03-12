@@ -26,6 +26,12 @@ import {
   parseThreadTokenUsageNotification
 } from "./eventParser";
 import { JsonRpcClient } from "./jsonRpcClient";
+import {
+  assignMissingTimelineOrder,
+  parseMessageTimestampMs,
+  sortMessagesAscending,
+  toolCallCompletenessScore
+} from "./messageChronology";
 
 type ClientState = {
   endpoint: string;
@@ -200,7 +206,7 @@ export const listThreads = async (device: DeviceRecord): Promise<SessionSummary[
   }
 
   return [...collected.values()].sort(
-    (a, b) => parseTimestampMs(b.updatedAt) - parseTimestampMs(a.updatedAt)
+    (a, b) => parseMessageTimestampMs(b.updatedAt) - parseMessageTimestampMs(a.updatedAt)
   );
 };
 
@@ -1688,16 +1694,8 @@ const dedupeHistoricalMessages = (messages: ChatMessage[]): ChatMessage[] => {
     deduped.set(key, existing ? preferRicherMessage(existing, message) : message);
   }
 
-  return assignTimelineOrder([...deduped.values()]).sort(sortMessagesAscending);
+  return assignMissingTimelineOrder([...deduped.values()]).sort(sortMessagesAscending);
 };
-
-const assignTimelineOrder = (messages: ChatMessage[]): ChatMessage[] =>
-  messages.map((message, index) => ({
-    ...message,
-    ...(typeof message.timelineOrder === "number"
-      ? {}
-      : { timelineOrder: index })
-  }));
 
 const strictMessageIdentityKey = (message: ChatMessage): string => {
   const normalizedTimestamp = normalizeIso(message.createdAt) ?? message.createdAt;
@@ -1734,41 +1732,6 @@ const preferRicherMessage = (
   }
 
   return incoming.content.length >= current.content.length ? incoming : current;
-};
-
-const toolCallCompletenessScore = (message: ChatMessage): number => {
-  if (!message.toolCall) {
-    return 0;
-  }
-  return (
-    (message.toolCall.name.trim().length > 0 ? 1 : 0) +
-    (message.toolCall.input?.trim().length ? 1 : 0) +
-    (message.toolCall.output?.trim().length ? 2 : 0) +
-    (message.toolCall.status === "completed" || message.toolCall.status === "failed" ? 1 : 0)
-  );
-};
-
-const sortMessagesAscending = (a: ChatMessage, b: ChatMessage): number => {
-  const aMs = parseTimestampMs(a.createdAt);
-  const bMs = parseTimestampMs(b.createdAt);
-  if (aMs === -1 && bMs === -1) {
-    return compareTimelineOrder(a, b);
-  }
-  if (aMs === bMs) {
-    return compareTimelineOrder(a, b);
-  }
-  return aMs - bMs;
-};
-
-const compareTimelineOrder = (a: ChatMessage, b: ChatMessage): number => {
-  if (
-    typeof a.timelineOrder === "number" &&
-    typeof b.timelineOrder === "number" &&
-    a.timelineOrder !== b.timelineOrder
-  ) {
-    return a.timelineOrder - b.timelineOrder;
-  }
-  return 0;
 };
 
 const parseMessageLike = (
@@ -2076,11 +2039,6 @@ const pickTimestampIso = (
   }
 
   return null;
-};
-
-const parseTimestampMs = (value: string): number => {
-  const parsed = Date.parse(value);
-  return Number.isNaN(parsed) ? -1 : parsed;
 };
 
 const pickSummaryPreview = (
