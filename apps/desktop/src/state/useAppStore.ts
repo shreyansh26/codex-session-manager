@@ -222,6 +222,7 @@ const mergeStoredMessage = (
   content: mergeMessageContent(current, incoming),
   createdAt: pickMergedTimestamp(current, incoming),
   timelineOrder: pickMergedTimelineOrder(current, incoming),
+  chronologySource: pickMergedChronologySource(current, incoming),
   toolCall: mergeToolCalls(current.toolCall, incoming.toolCall)
 });
 
@@ -348,7 +349,56 @@ const shouldPreserveEarliestUserTimestamp = (
   !incoming.toolCall;
 
 const isCompactedRolloutHistoryMessage = (message: ChatMessage): boolean =>
-  message.eventType !== "tool_call" && message.id.startsWith("message-");
+  message.eventType !== "tool_call" &&
+  (message.chronologySource === "rollout" || message.id.startsWith("message-"));
+
+const chronologyRank = (
+  source: ChatMessage["chronologySource"]
+): number => {
+  switch (source) {
+    case "rollout":
+      return 3;
+    case "turn":
+      return 2;
+    case "live":
+      return 1;
+    case "flat_fallback":
+      return 0;
+    default:
+      return -1;
+  }
+};
+
+const isAuthoritativeChronologySource = (
+  source: ChatMessage["chronologySource"]
+): boolean => source === "turn" || source === "rollout";
+
+const isLegacyChronologyAnchor = (message: ChatMessage): boolean =>
+  !message.chronologySource &&
+  typeof message.timelineOrder === "number" &&
+  !isOptimisticMessage(message);
+
+const shouldPromoteIncomingChronology = (
+  current: ChatMessage,
+  incoming: ChatMessage
+): boolean =>
+  (current.chronologySource === "flat_fallback" || isLegacyChronologyAnchor(current)) &&
+  isAuthoritativeChronologySource(incoming.chronologySource);
+
+const shouldPreserveCurrentChronology = (
+  current: ChatMessage,
+  incoming: ChatMessage
+): boolean =>
+  isAuthoritativeChronologySource(current.chronologySource) &&
+  incoming.chronologySource === "flat_fallback";
+
+const pickMergedChronologySource = (
+  current: ChatMessage,
+  incoming: ChatMessage
+): ChatMessage["chronologySource"] =>
+  chronologyRank(incoming.chronologySource) >= chronologyRank(current.chronologySource)
+    ? incoming.chronologySource ?? current.chronologySource
+    : current.chronologySource;
 
 const isRestampedHistoryTwinCandidate = (
   current: ChatMessage,
@@ -771,6 +821,12 @@ const pickMergedTimestamp = (
   current: ChatMessage,
   incoming: ChatMessage
 ): string => {
+  if (shouldPromoteIncomingChronology(current, incoming)) {
+    return incoming.createdAt;
+  }
+  if (shouldPreserveCurrentChronology(current, incoming)) {
+    return current.createdAt;
+  }
   if (shouldPreserveCurrentTimestamp(current, incoming)) {
     return current.createdAt;
   }
@@ -788,10 +844,17 @@ const pickMergedTimestamp = (
 const pickMergedTimelineOrder = (
   current: ChatMessage,
   incoming: ChatMessage
-): number | undefined =>
-  typeof current.timelineOrder === "number"
+): number | undefined => {
+  if (shouldPromoteIncomingChronology(current, incoming)) {
+    return incoming.timelineOrder ?? current.timelineOrder;
+  }
+  if (shouldPreserveCurrentChronology(current, incoming)) {
+    return current.timelineOrder ?? incoming.timelineOrder;
+  }
+  return typeof current.timelineOrder === "number"
     ? current.timelineOrder
     : incoming.timelineOrder;
+};
 
 const shouldPreserveCurrentTimestamp = (
   current: ChatMessage,
@@ -832,11 +895,12 @@ const preferCanonicalMessage = (
 ): ChatMessage => {
   const preserveTimelineOrder = (winner: ChatMessage): ChatMessage => ({
     ...winner,
-    ...(typeof current.timelineOrder === "number"
-      ? { timelineOrder: current.timelineOrder }
-      : typeof incoming.timelineOrder === "number"
-        ? { timelineOrder: incoming.timelineOrder }
-        : {})
+    ...(typeof pickMergedTimelineOrder(current, incoming) === "number"
+      ? { timelineOrder: pickMergedTimelineOrder(current, incoming) }
+      : {}),
+    ...(pickMergedChronologySource(current, incoming)
+      ? { chronologySource: pickMergedChronologySource(current, incoming) }
+      : {})
   });
   const currentReasoning = current.eventType === "reasoning";
   const incomingReasoning = incoming.eventType === "reasoning";
@@ -1048,13 +1112,16 @@ const mergeRolloutEnrichmentMessages = (
   existing: ChatMessage[],
   enrichment: ChatMessage[]
 ): ChatMessage[] => {
-  const normalizedExisting = dedupeMessagesByIdentity(existing);
+  const normalizedEnrichment = normalizeSnapshotMessages(enrichment);
+  const normalizedExisting = stripCollapsedTurnHistoryShadow(
+    stripSupersededTurnReasoning(dedupeMessagesByIdentity(existing), normalizedEnrichment),
+    normalizedEnrichment
+  );
   const mergedByIdentity = new Map<string, ChatMessage>();
   for (const message of normalizedExisting) {
     mergedByIdentity.set(messageIdentityKey(message), message);
   }
 
-  const normalizedEnrichment = normalizeSnapshotMessages(enrichment);
   const enrichmentChatOrdinals = buildServerChatOrdinalLookup(normalizedEnrichment);
 
   for (const message of normalizedEnrichment) {
@@ -1095,7 +1162,128 @@ const mergeRolloutEnrichmentMessages = (
     );
   }
 
-  return dedupeEquivalentServerMessages([...mergedByIdentity.values()]);
+  return reanchorCollapsedTurnMessages(
+    dedupeEquivalentServerMessages([...mergedByIdentity.values()])
+  ).sort(sortMessagesAscending);
+};
+
+const stripSupersededTurnReasoning = (
+  existing: ChatMessage[],
+  enrichment: ChatMessage[]
+): ChatMessage[] => {
+  const rolloutReasoning = enrichment.filter(
+    (message) =>
+      message.chronologySource === "rollout" && message.eventType === "reasoning"
+  );
+  if (rolloutReasoning.length === 0) {
+    return existing;
+  }
+
+  return existing.filter((message) => {
+    if (message.chronologySource !== "turn" || message.eventType !== "reasoning") {
+      return true;
+    }
+
+    const currentText = normalizeMessageText(message.content).toLowerCase();
+    return !rolloutReasoning.some((candidate) => {
+      const candidateText = normalizeMessageText(candidate.content).toLowerCase();
+      return (
+        candidateText.length > 0 &&
+        (currentText === candidateText ||
+          currentText.includes(candidateText) ||
+          candidateText.includes(currentText))
+      );
+    });
+  });
+};
+
+const findEarliestRolloutTimestampMs = (messages: ChatMessage[]): number | null => {
+  let earliest: number | null = null;
+  for (const message of messages) {
+    if (message.chronologySource !== "rollout") {
+      continue;
+    }
+    const timestampMs = Date.parse(message.createdAt);
+    if (!Number.isFinite(timestampMs)) {
+      continue;
+    }
+    earliest = earliest === null ? timestampMs : Math.min(earliest, timestampMs);
+  }
+  return earliest;
+};
+
+const stripCollapsedTurnHistoryShadow = (
+  existing: ChatMessage[],
+  enrichment: ChatMessage[]
+): ChatMessage[] => {
+  const earliestRolloutTimestampMs = findEarliestRolloutTimestampMs(enrichment);
+  if (earliestRolloutTimestampMs === null) {
+    return existing;
+  }
+
+  return existing.filter((message) => {
+    if (message.chronologySource !== "turn" || message.role === "user") {
+      return true;
+    }
+
+    const currentTimestampMs = Date.parse(message.createdAt);
+    if (!Number.isFinite(currentTimestampMs)) {
+      return true;
+    }
+
+    return currentTimestampMs < earliestRolloutTimestampMs;
+  });
+};
+
+const reanchorCollapsedTurnMessages = (messages: ChatMessage[]): ChatMessage[] => {
+  const withTimeline = messages
+    .filter(
+      (message): message is ChatMessage & { timelineOrder: number } =>
+        typeof message.timelineOrder === "number"
+    )
+    .sort((left, right) => left.timelineOrder - right.timelineOrder);
+  const earliestRollout = withTimeline.find(
+    (message) => message.chronologySource === "rollout"
+  );
+
+  const restamped = new Map<string, string>();
+  for (const message of withTimeline) {
+    if (
+      message.chronologySource !== "turn" ||
+      message.eventType === "reasoning" ||
+      message.role !== "user"
+    ) {
+      continue;
+    }
+
+    if (!earliestRollout) {
+      continue;
+    }
+
+    const currentMs = Date.parse(message.createdAt);
+    const nextMs = Date.parse(earliestRollout.createdAt);
+    if (!Number.isFinite(currentMs) || !Number.isFinite(nextMs) || currentMs < nextMs) {
+      continue;
+    }
+
+    restamped.set(
+      messageIdentityKey(message),
+      new Date(Math.max(0, nextMs - 1)).toISOString()
+    );
+  }
+
+  if (restamped.size === 0) {
+    return messages;
+  }
+
+  return messages.map((message) =>
+    restamped.has(messageIdentityKey(message))
+      ? {
+          ...message,
+          createdAt: restamped.get(messageIdentityKey(message)) ?? message.createdAt
+        }
+      : message
+  );
 };
 
 const sameThreadHydrationState = (

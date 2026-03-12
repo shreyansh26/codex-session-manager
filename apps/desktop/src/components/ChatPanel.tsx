@@ -7,6 +7,7 @@ import type {
 } from "../domain/types";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import type { VisibleMessageWindow } from "./chatWindow";
 import { getMessageWindowKey, resolveVisibleMessageWindow } from "./chatWindow";
 
 interface ChatPanelProps {
@@ -16,6 +17,7 @@ interface ChatPanelProps {
   hydrationState: ThreadHydrationState;
   scrollToMessageId?: string | null;
   onScrollToMessageHandled?: (messageId: string) => void;
+  windowOverride?: VisibleMessageWindow;
 }
 
 const numberFormatter = new Intl.NumberFormat("en-US");
@@ -70,6 +72,9 @@ const messageLabel = (message: ChatMessage): string => {
   if (message.role === "user") {
     return "user";
   }
+  if (message.toolCall) {
+    return "Tool Call";
+  }
   if (message.eventType === "tool_call") {
     return "Tool Call";
   }
@@ -85,7 +90,7 @@ const messageLabel = (message: ChatMessage): string => {
 const hasTextContent = (value: string): boolean => value.trim().length > 0;
 
 const isToolCallMessage = (message: ChatMessage): boolean =>
-  message.eventType === "tool_call" && Boolean(message.toolCall);
+  Boolean(message.toolCall);
 
 const formatToolStatus = (message: ChatMessage): string | null => {
   const status = message.toolCall?.status;
@@ -113,7 +118,8 @@ function ChatPanel({
   costDisplay,
   hydrationState,
   scrollToMessageId,
-  onScrollToMessageHandled
+  onScrollToMessageHandled,
+  windowOverride
 }: ChatPanelProps) {
   const panelRef = useRef<HTMLElement | null>(null);
   const messageRefs = useRef(new Map<string, HTMLElement>());
@@ -126,7 +132,7 @@ function ChatPanel({
   const [visibleStartMessageKey, setVisibleStartMessageKey] = useState<string | null>(null);
   const [expandedToolOutputs, setExpandedToolOutputs] = useState<Record<string, boolean>>({});
 
-  const { hiddenMessageCount, startIndex, visibleMessages } = useMemo(
+  const resolvedWindow = useMemo(
     () =>
       resolveVisibleMessageWindow({
         messages,
@@ -135,6 +141,8 @@ function ChatPanel({
       }),
     [messages, visibleMessageCount, visibleStartMessageKey]
   );
+  const { hiddenMessageCount, startIndex, visibleMessages } =
+    windowOverride ?? resolvedWindow;
 
   useEffect(() => {
     stickToBottomRef.current = true;
@@ -367,6 +375,12 @@ function ChatPanel({
             <li
               key={renderKey}
               data-message-id={message.id}
+              data-message-key={renderKey}
+              data-message-role={message.role}
+              data-event-type={message.eventType ?? ""}
+              data-message-label={messageLabel(message)}
+              data-tool-name={message.toolCall?.name ?? ""}
+              data-tool-status={formatToolStatus(message) ?? ""}
               ref={(element) => {
                 if (!element) {
                   messageRefs.current.delete(renderKey);

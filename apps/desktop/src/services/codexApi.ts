@@ -27,6 +27,7 @@ import {
 } from "./eventParser";
 import { JsonRpcClient } from "./jsonRpcClient";
 import {
+  assignNumericFlatSnapshotTimelineOrder,
   assignMissingTimelineOrder,
   parseMessageTimestampMs,
   sortMessagesAscending,
@@ -286,7 +287,7 @@ export const readThread = async (
   const preview = pickSummaryPreview(thread);
   const baseTitle = deriveSessionBaseTitle(thread, threadId, preview);
   const cwd = pickString(thread, ["cwd", "workingDirectory", "working_directory"]);
-  const rolloutPath = pickString(thread, ["path"]);
+  const preferredRolloutPath = pickString(thread, ["path"]);
   const folderName = folderNameFromPath(cwd);
   const model = pickThreadModel(thread);
 
@@ -306,15 +307,20 @@ export const readThread = async (
   const threadMessages = options?.skipMessages
     ? []
     : parseMessagesFromThread(device.id, threadId, thread);
-  const rolloutMessages =
+  const rolloutHistory =
     options?.skipMessages || options?.includeRolloutMessages === false
-      ? []
-      : await readRolloutTimelineMessages(device, threadId, rolloutPath, session.updatedAt);
+      ? { rolloutPath: preferredRolloutPath?.trim() || null, messages: [] as ChatMessage[] }
+      : await recoverRolloutHistoryForThread(
+          device,
+          threadId,
+          preferredRolloutPath,
+          session.updatedAt
+        );
   const messages =
     options?.skipMessages
       ? []
-      : rolloutMessages.length > 0
-      ? rolloutMessages
+      : rolloutHistory.messages.length > 0
+      ? rolloutHistory.messages
       : dedupeHistoricalMessages(threadMessages);
   if (!options?.skipMessages) {
     const firstUserMessage = messages.find((message) => message.role === "user");
@@ -334,7 +340,7 @@ export const readThread = async (
   return {
     session,
     messages,
-    ...(rolloutPath ? { rolloutPath } : {}),
+    ...(rolloutHistory.rolloutPath ? { rolloutPath: rolloutHistory.rolloutPath } : {}),
     ...(model ? { model } : {})
   };
 };
@@ -590,6 +596,60 @@ export const readRolloutTimelineMessages = async (
   return pending;
 };
 
+const recoverRolloutHistoryForThread = async (
+  device: DeviceRecord,
+  threadId: string,
+  rolloutPath: string | null | undefined,
+  revision?: string,
+  deps: {
+    findLatestRolloutPath?: typeof findLatestRolloutPathForThread;
+    readRolloutMessages?: typeof readRolloutTimelineMessages;
+  } = {}
+): Promise<{ rolloutPath: string | null; messages: ChatMessage[] }> => {
+  const findLatestRolloutPath =
+    deps.findLatestRolloutPath ?? findLatestRolloutPathForThread;
+  const readRolloutMessages = deps.readRolloutMessages ?? readRolloutTimelineMessages;
+  const normalizedPreferredPath = rolloutPath?.trim() || null;
+  const initialMessages = await readRolloutMessages(
+    device,
+    threadId,
+    normalizedPreferredPath,
+    revision
+  );
+  if (initialMessages.length > 0) {
+    return {
+      rolloutPath: normalizedPreferredPath,
+      messages: initialMessages
+    };
+  }
+
+  const recoveredPath = await findLatestRolloutPath(device, threadId);
+  const normalizedRecoveredPath = recoveredPath?.trim() || null;
+  if (!normalizedRecoveredPath) {
+    return {
+      rolloutPath: normalizedPreferredPath,
+      messages: initialMessages
+    };
+  }
+
+  if (normalizedRecoveredPath === normalizedPreferredPath) {
+    return {
+      rolloutPath: normalizedRecoveredPath,
+      messages: initialMessages
+    };
+  }
+
+  return {
+    rolloutPath: normalizedRecoveredPath,
+    messages: await readRolloutMessages(
+      device,
+      threadId,
+      normalizedRecoveredPath,
+      revision
+    )
+  };
+};
+
 const readRolloutTimelineMessagesUncached = async (
   device: DeviceRecord,
   threadId: string,
@@ -810,6 +870,7 @@ const toHistoryMessageFromRolloutRecord = (
     role,
     content: pickString(record, ["content"]) ?? "",
     createdAt,
+    chronologySource: "rollout",
     ...(typeof pickNumber(record, ["order"]) === "number"
       ? { timelineOrder: pickNumber(record, ["order"]) ?? undefined }
       : {}),
@@ -858,6 +919,7 @@ const toToolMessageFromRolloutEntry = (
   eventType: "tool_call",
   content: formatRolloutToolMessageContent(entry),
   createdAt: entry.createdAt,
+  chronologySource: "rollout",
   ...(typeof entry.order === "number" ? { timelineOrder: entry.order } : {}),
   toolCall: {
     name: entry.name,
@@ -1669,11 +1731,19 @@ const parseMessagesFromThread = (
       parseItemLike(deviceId, threadId, item, turnCreatedAt)
     );
 
-    return [...messages, ...items];
+    return [...messages, ...items].map((message) => ({
+      ...message,
+      chronologySource: "turn" as const
+    }));
   });
 
   if (fromTurns.length === 0) {
-    return dedupeHistoricalMessages(fromMessages);
+    return dedupeHistoricalMessages(
+      assignNumericFlatSnapshotTimelineOrder(fromMessages).map((message) => ({
+        ...message,
+        chronologySource: "flat_fallback" as const
+      }))
+    );
   }
 
   const turnMessageKeys = new Set(
@@ -1683,7 +1753,13 @@ const parseMessagesFromThread = (
     (message) => !turnMessageKeys.has(messageIdentityWithoutTimestamp(message))
   );
 
-  return dedupeHistoricalMessages([...fromTurns, ...supplementalTopLevelMessages]);
+  return dedupeHistoricalMessages([
+    ...fromTurns,
+    ...supplementalTopLevelMessages.map((message) => ({
+      ...message,
+      chronologySource: "flat_fallback" as const
+    }))
+  ]);
 };
 
 const dedupeHistoricalMessages = (messages: ChatMessage[]): ChatMessage[] => {
@@ -2285,5 +2361,6 @@ const asErrorMessage = (error: unknown): string =>
 
 export const __TEST_ONLY__ = {
   parseMessagesFromThread,
-  toTimelineMessageFromRolloutRecord
+  toTimelineMessageFromRolloutRecord,
+  recoverRolloutHistoryForThread
 };

@@ -4,11 +4,19 @@ import type {
   ComposerPreference,
   ThreadTokenUsageState
 } from "../domain/types";
+import { __TEST_ONLY__ as codexApiTest } from "../services/codexApi";
 import { __TEST_ONLY__ } from "../state/useAppStore";
 import {
   chronologyReplayFixtureById,
+  existingSessionChronologyFixture,
   type ExpectedToolBubble
 } from "./chronologyReplayFixtures";
+import {
+  historicalReopenRolloutRepairBaseMessages,
+  historicalReopenRolloutRepairExpectedBrokenOrder,
+  historicalReopenRolloutRepairExpectedFixedOrder,
+  historicalReopenRolloutRepairRolloutMessages
+} from "./reopenedSessionDiagnosticFixtures";
 import {
   applyChronologyReplayFixture,
   messageRoleIdOrder
@@ -43,6 +51,115 @@ const expectToolBubblesToMatch = (
     }
   });
 };
+
+const rolloutMessagesFromExistingSessionFixture = (): ChatMessage[] =>
+  existingSessionChronologyFixture.rolloutRecords
+    .map((record) =>
+      codexApiTest.toTimelineMessageFromRolloutRecord(
+        "device-1",
+        existingSessionChronologyFixture.threadId,
+        record
+      )
+    )
+    .filter((message): message is ChatMessage => message !== null);
+
+const legacyExistingSessionMessagesWithoutChronologySource = (): ChatMessage[] => {
+  const threadReadMessages = existingSessionChronologyFixture.threadReadSnapshot.messages;
+  if (!Array.isArray(threadReadMessages)) {
+    return [];
+  }
+
+  return threadReadMessages.flatMap((value, index) => {
+    if (!value || typeof value !== "object") {
+      return [];
+    }
+    const entry = value as Record<string, unknown>;
+    const id = typeof entry.id === "string" ? entry.id : "";
+    const role = entry.role;
+    const content = typeof entry.content === "string" ? entry.content : "";
+    if (!id || (role !== "user" && role !== "assistant" && role !== "system")) {
+      return [];
+    }
+    return [
+      buildMessage({
+        id,
+        threadId: existingSessionChronologyFixture.threadId,
+        key: `device-1::${existingSessionChronologyFixture.threadId}`,
+        role,
+        content,
+        createdAt: "2026-01-10T16:01:40.000Z",
+        timelineOrder: index
+      })
+    ];
+  });
+};
+
+const turnReloadMessagesFromExistingSessionFixture = (): ChatMessage[] =>
+  codexApiTest.parseMessagesFromThread(
+    "device-1",
+    existingSessionChronologyFixture.threadId,
+    {
+      createdAt: "2026-01-10T16:01:40.000Z",
+      turns: [
+        {
+          createdAt: "2026-01-10T16:01:40.000Z",
+          messages: [
+            {
+              id: "item-1",
+              role: "user",
+              content:
+                "Set up a GitHub Action that emails me whenever tracked repositories receive new commits."
+            },
+            {
+              id: "item-2",
+              role: "assistant",
+              content:
+                "I’m inspecting the empty repository first, then I’ll scaffold the workflow and config files."
+            }
+          ]
+        },
+        {
+          createdAt: "2026-01-10T16:01:40.000Z",
+          messages: [
+            {
+              id: "item-3",
+              role: "user",
+              content: "Track pushes on the main and release branches."
+            },
+            {
+              id: "item-4",
+              role: "assistant",
+              content:
+                "I added a tracked-repositories config file so the workflow knows which branches to watch."
+            }
+          ]
+        },
+        {
+          createdAt: "2026-01-10T16:01:40.000Z",
+          messages: [
+            {
+              id: "item-10",
+              role: "assistant",
+              content:
+                "I found the workflow syntax issue and corrected the invalid trigger configuration."
+            },
+            {
+              id: "item-11",
+              role: "assistant",
+              content:
+                "The repository now sends email notifications for configured branches and includes setup notes."
+            }
+          ]
+        }
+      ]
+    }
+  );
+
+const rolloutMessagesWithCollapsedTimestampsFromExistingSessionFixture = (): ChatMessage[] =>
+  rolloutMessagesFromExistingSessionFixture().map((message) => ({
+    ...message,
+    createdAt: "2026-01-10T16:01:40.000Z"
+  }));
 
 describe("useAppStore message upsert behavior", () => {
   it("replaces optimistic user message when server acknowledgement arrives", () => {
@@ -726,8 +843,175 @@ describe("useAppStore message upsert behavior", () => {
     ]);
   });
 
+  it("replaces flat-fallback chronology anchors when authoritative rollout history arrives later", () => {
+    const snapshotMessages = codexApiTest.parseMessagesFromThread(
+      "device-1",
+      existingSessionChronologyFixture.threadId,
+      existingSessionChronologyFixture.threadReadSnapshot
+    );
+    const rolloutMessages = rolloutMessagesFromExistingSessionFixture();
+
+    const firstLoad = __TEST_ONLY__.mergeSnapshotMessages([], snapshotMessages);
+    const repaired = __TEST_ONLY__.mergeRolloutEnrichmentMessages(
+      firstLoad,
+      rolloutMessages
+    );
+
+    expect(messageRoleIdOrder(firstLoad)).toEqual(
+      existingSessionChronologyFixture.expectedNumericSnapshotOrder
+    );
+    expect(repaired.map((message) => `${message.role}:${message.id}`)).toEqual([
+      "user:item-1",
+      "assistant:item-2",
+      "user:item-3",
+      "assistant:item-4",
+      "assistant:item-10",
+      "assistant:item-11"
+    ]);
+    expect(repaired.map((message) => message.createdAt)).toEqual([
+      "2026-01-10T15:06:13.810Z",
+      "2026-01-10T15:06:40.237Z",
+      "2026-01-10T15:07:01.905Z",
+      "2026-01-10T15:07:32.422Z",
+      "2026-01-10T15:09:41.901Z",
+      "2026-01-10T15:10:18.044Z"
+    ]);
+  });
+
+  it("re-anchors legacy persisted snapshots missing chronologySource when an authoritative turn reload arrives", () => {
+    const legacy = legacyExistingSessionMessagesWithoutChronologySource();
+    const authoritativeReload = turnReloadMessagesFromExistingSessionFixture();
+    const repaired = __TEST_ONLY__.mergeSnapshotMessages(legacy, authoritativeReload);
+
+    expect(messageRoleIdOrder(legacy)).toEqual(
+      existingSessionChronologyFixture.expectedLexicographicSnapshotOrder
+    );
+    expect(messageRoleIdOrder(authoritativeReload)).toEqual(
+      existingSessionChronologyFixture.expectedNumericSnapshotOrder
+    );
+    expect(messageRoleIdOrder(repaired)).toEqual(
+      existingSessionChronologyFixture.expectedNumericSnapshotOrder
+    );
+    expect(repaired.map((message) => message.timelineOrder)).toEqual([0, 1, 2, 3, 4, 5]);
+  });
+
+  it("re-anchors legacy persisted snapshots missing chronologySource when rollout enrichment keeps collapsed timestamps", () => {
+    const legacy = legacyExistingSessionMessagesWithoutChronologySource();
+    const collapsedRollout =
+      rolloutMessagesWithCollapsedTimestampsFromExistingSessionFixture();
+    const repaired = __TEST_ONLY__.mergeRolloutEnrichmentMessages(
+      legacy,
+      collapsedRollout
+    );
+
+    expect(messageRoleIdOrder(legacy)).toEqual(
+      existingSessionChronologyFixture.expectedLexicographicSnapshotOrder
+    );
+    expect(messageRoleIdOrder(repaired)).toEqual(
+      existingSessionChronologyFixture.expectedNumericSnapshotOrder
+    );
+    expect(repaired.map((message) => message.timelineOrder)).toEqual([0, 1, 2, 3, 4, 5]);
+  });
+
+  it("drops superseded turn reasoning blocks when rollout chronology repairs a reopened historical session", () => {
+    const broken = __TEST_ONLY__.mergeRolloutEnrichmentMessages(
+      historicalReopenRolloutRepairBaseMessages,
+      historicalReopenRolloutRepairRolloutMessages
+    );
+
+    expect(messageRoleIdOrder(broken)).toEqual(
+      historicalReopenRolloutRepairExpectedFixedOrder
+    );
+    expect(messageRoleIdOrder(broken)).not.toEqual(
+      historicalReopenRolloutRepairExpectedBrokenOrder
+    );
+  });
+
+  it("drops collapsed turn assistant history and reanchors turn users against rollout chronology", () => {
+    const merged = __TEST_ONLY__.mergeRolloutEnrichmentMessages(
+      [
+        buildMessage({
+          id: "item-user-1",
+          role: "user",
+          chronologySource: "turn",
+          timelineOrder: 0,
+          createdAt: "2026-03-12T14:15:49.000Z",
+          content: "Write the updated plan to plan_message_chronology_v3.md"
+        }),
+        buildMessage({
+          id: "item-assistant-2",
+          role: "assistant",
+          chronologySource: "turn",
+          timelineOrder: 1,
+          createdAt: "2026-03-12T14:15:49.000Z",
+          content: "Ledger Snapshot: Goal is to update plan_message_chronology_v3.md"
+        }),
+        buildMessage({
+          id: "item-assistant-3",
+          role: "assistant",
+          chronologySource: "turn",
+          timelineOrder: 2,
+          createdAt: "2026-03-12T14:15:49.000Z",
+          content: "The updated v3 plan is in place."
+        })
+      ],
+      [
+        buildMessage({
+          id: "message-live-1",
+          role: "assistant",
+          chronologySource: "rollout",
+          timelineOrder: 0,
+          createdAt: "2026-03-12T14:08:07.798Z",
+          content: "Ledger Snapshot: The reopened-session bug is not actually fixed."
+        }),
+        buildMessage({
+          id: "call-live-1",
+          role: "tool",
+          chronologySource: "rollout",
+          eventType: "tool_call",
+          timelineOrder: 1,
+          createdAt: "2026-03-12T14:08:08.687Z",
+          content: "Tool: exec_command",
+          toolCall: {
+            name: "exec_command",
+            input: "sed -n '1,220p' CONTINUITY.md",
+            status: "completed"
+          }
+        }),
+        buildMessage({
+          id: "message-live-2",
+          role: "assistant",
+          chronologySource: "rollout",
+          timelineOrder: 2,
+          createdAt: "2026-03-12T14:08:21.254Z",
+          content: "Ledger Snapshot: Historical reopen is still reconstructing the wrong transcript."
+        })
+      ]
+    );
+
+    expect(messageRoleIdOrder(merged)).toEqual([
+      "user:item-user-1",
+      "assistant:message-live-1",
+      "tool:call-live-1",
+      "assistant:message-live-2"
+    ]);
+    expect(merged.find((message) => message.id === "item-assistant-2")).toBeUndefined();
+    expect(merged.find((message) => message.id === "item-assistant-3")).toBeUndefined();
+    expect(merged.find((message) => message.id === "item-user-1")?.createdAt).toBe(
+      "2026-03-12T14:08:07.797Z"
+    );
+  });
+
   it("replays mixed live+snapshot+rollout convergence from the shared chronology corpus", () => {
     const fixture = chronologyReplayFixtureById["live-snapshot-rollout-tool-convergence"];
+    const messages = applyChronologyReplayFixture(fixture);
+
+    expect(messageRoleIdOrder(messages)).toEqual(fixture.expectedOrder);
+    expectToolBubblesToMatch(messages, fixture.expectedToolBubbles);
+  });
+
+  it("stays immune to stale snapshot refresh drift in store-level replay", () => {
+    const fixture = chronologyReplayFixtureById["stale-refresh-pulls-old-tool-upward"];
     const messages = applyChronologyReplayFixture(fixture);
 
     expect(messageRoleIdOrder(messages)).toEqual(fixture.expectedOrder);

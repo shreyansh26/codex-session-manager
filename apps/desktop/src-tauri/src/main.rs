@@ -4,6 +4,7 @@ mod commands;
 mod state;
 
 use commands::{
+    debug_persist_artifact,
     device_add_local, device_add_ssh, device_connect, device_disconnect, device_list,
     device_remove, search_bootstrap_status, search_index_remove_device, search_index_upsert_thread,
     search_query,
@@ -22,6 +23,7 @@ fn main() {
             device_connect,
             device_disconnect,
             device_remove,
+            debug_persist_artifact,
             search_index_upsert_thread,
             search_index_remove_device,
             search_query,

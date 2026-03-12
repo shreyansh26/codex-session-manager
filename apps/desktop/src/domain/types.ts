@@ -3,6 +3,11 @@ export type ChatRole = "user" | "assistant" | "system" | "tool";
 export type ThinkingEffort = "low" | "medium" | "high" | "xhigh";
 export type ChatMessageEventType = "reasoning" | "activity" | "tool_call";
 export type ChatToolCallStatus = "running" | "completed" | "failed";
+export type ChatMessageChronologySource =
+  | "rollout"
+  | "turn"
+  | "flat_fallback"
+  | "live";
 
 export interface ChatToolCall {
   name: string;
@@ -73,6 +78,7 @@ export interface ChatMessage {
   content: string;
   createdAt: string;
   timelineOrder?: number;
+  chronologySource?: ChatMessageChronologySource;
   images?: ChatImageAttachment[];
   toolCall?: ChatToolCall;
 }
