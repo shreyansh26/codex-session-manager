@@ -125,6 +125,7 @@ export const parseRpcNotification = (
         role,
         content: payload.content,
         createdAt,
+        chronologySource: "live",
         ...(images.length > 0 ? { images } : {}),
         ...(payload.eventType ? { eventType: payload.eventType } : {}),
         ...(payload.toolCall ? { toolCall: payload.toolCall } : {})
@@ -239,6 +240,7 @@ export const parseRpcNotification = (
         role: activityPayload.toolCall ? "tool" : "system",
         content: activityPayload.content,
         createdAt,
+        chronologySource: "live",
         ...(activityPayload.eventType ? { eventType: activityPayload.eventType } : {}),
         ...(activityPayload.toolCall ? { toolCall: activityPayload.toolCall } : {})
       }
@@ -296,6 +298,7 @@ export const parseRpcNotification = (
       role: role,
       content: payload.content,
       createdAt,
+      chronologySource: "live",
       ...(images.length > 0 ? { images } : {}),
       ...(payload.eventType ? { eventType: payload.eventType } : {}),
       ...(payload.toolCall ? { toolCall: payload.toolCall } : {})

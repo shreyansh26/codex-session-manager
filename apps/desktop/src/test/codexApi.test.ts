@@ -10,7 +10,10 @@ import {
 } from "../services/codexApi";
 import type { ChatImageAttachment, ChatMessage, ComposerSubmission } from "../domain/types";
 import { parseRpcNotification } from "../services/eventParser";
-import { chronologyReplayFixtureById } from "./chronologyReplayFixtures";
+import {
+  chronologyReplayFixtureById,
+  existingSessionChronologyFixture
+} from "./chronologyReplayFixtures";
 
 const sampleImage = (url: string): ChatImageAttachment => ({
   id: "img-1",
@@ -422,6 +425,69 @@ describe("parseMessagesFromThread", () => {
     ]);
     expect(messages.find((message) => message.id === "reasoning")?.eventType).toBe(
       "reasoning"
+    );
+  });
+
+  it("reorders flat existing-session item snapshots numerically when turns are missing", () => {
+    const messages = codexApiTest.parseMessagesFromThread(
+      "device-1",
+      existingSessionChronologyFixture.threadId,
+      existingSessionChronologyFixture.threadReadSnapshot
+    );
+
+    expect(messages.map((message) => `${message.role}:${message.id}`)).toEqual(
+      existingSessionChronologyFixture.expectedNumericSnapshotOrder
+    );
+  });
+
+  it("prefers recovered rollout chronology when opening a historical existing session later", async () => {
+    const snapshotMessages = codexApiTest.parseMessagesFromThread(
+      "device-1",
+      existingSessionChronologyFixture.threadId,
+      existingSessionChronologyFixture.threadReadSnapshot
+    );
+    const rolloutMessages = existingSessionChronologyFixture.rolloutRecords
+      .map((record) =>
+        codexApiTest.toTimelineMessageFromRolloutRecord(
+          "device-1",
+          existingSessionChronologyFixture.threadId,
+          record
+        )
+      )
+      .filter((message): message is ChatMessage => message !== null);
+
+    const recovered = await codexApiTest.recoverRolloutHistoryForThread(
+      {
+        id: "mock-local-device",
+        name: "Local Device",
+        config: { kind: "local" },
+        connected: true,
+        connection: {
+          endpoint: "mock://local/mock-local-device",
+          transport: "mock-jsonrpc",
+          connectedAtMs: Date.UTC(2026, 2, 12, 9, 30, 0, 0)
+        }
+      },
+      existingSessionChronologyFixture.threadId,
+      null,
+      "2026-01-10T16:12:55.000Z",
+      {
+        findLatestRolloutPath: async () =>
+          `/Users/mock/.codex/sessions/2026/01/10/rollout-${existingSessionChronologyFixture.threadId}.jsonl`,
+        readRolloutMessages: async (_device, _threadId, path) =>
+          path ? rolloutMessages : []
+      }
+    );
+
+    const openedMessages =
+      recovered.messages.length > 0 ? recovered.messages : snapshotMessages;
+
+    expect(snapshotMessages.map((message) => `${message.role}:${message.id}`)).toEqual(
+      existingSessionChronologyFixture.expectedNumericSnapshotOrder
+    );
+    expect(recovered.rolloutPath).toContain(existingSessionChronologyFixture.threadId);
+    expect(openedMessages.map((message) => `${message.role}:${message.id}`)).toEqual(
+      existingSessionChronologyFixture.expectedCanonicalOrder
     );
   });
 });

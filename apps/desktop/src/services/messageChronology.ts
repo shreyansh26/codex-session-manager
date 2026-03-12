@@ -1,5 +1,7 @@
 import type { ChatMessage } from "../domain/types";
 
+const ITEM_ID_SEQUENCE_PATTERN = /^item-(\d+)(?:::.*)?$/;
+
 export const toolCallCompletenessScore = (message: ChatMessage): number => {
   if (!message.toolCall) {
     return 0;
@@ -58,3 +60,50 @@ export const assignMissingTimelineOrder = (messages: ChatMessage[]): ChatMessage
       ? {}
       : { timelineOrder: index })
   }));
+
+export const extractFlatItemSequence = (messageId: string): number | null => {
+  const match = ITEM_ID_SEQUENCE_PATTERN.exec(messageId);
+  if (!match) {
+    return null;
+  }
+
+  const numeric = Number.parseInt(match[1] ?? "", 10);
+  return Number.isFinite(numeric) ? numeric : null;
+};
+
+export const assignNumericFlatSnapshotTimelineOrder = (
+  messages: ChatMessage[]
+): ChatMessage[] => {
+  if (messages.length < 2) {
+    return assignMissingTimelineOrder(messages);
+  }
+
+  const fallbackCreatedAt = messages[0]?.createdAt ?? null;
+  if (
+    !fallbackCreatedAt ||
+    !messages.every(
+      (message) =>
+        message.eventType !== "tool_call" &&
+        message.createdAt === fallbackCreatedAt &&
+        extractFlatItemSequence(message.id) !== null
+    )
+  ) {
+    return assignMissingTimelineOrder(messages);
+  }
+
+  return [...messages]
+    .map((message, index) => ({ message, index }))
+    .sort((left, right) => {
+      const leftSequence = extractFlatItemSequence(left.message.id) ?? Number.MAX_SAFE_INTEGER;
+      const rightSequence =
+        extractFlatItemSequence(right.message.id) ?? Number.MAX_SAFE_INTEGER;
+      if (leftSequence !== rightSequence) {
+        return leftSequence - rightSequence;
+      }
+      return left.index - right.index;
+    })
+    .map(({ message }, index) => ({
+      ...message,
+      timelineOrder: index
+    }));
+};

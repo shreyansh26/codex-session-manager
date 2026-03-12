@@ -46,6 +46,17 @@ export interface ChronologyReplayFixture {
   expectedToolBubbles: ExpectedToolBubble[];
 }
 
+export interface ExistingSessionChronologyFixture {
+  id: string;
+  description: string;
+  threadId: string;
+  threadReadSnapshot: Record<string, unknown>;
+  rolloutRecords: Array<Record<string, unknown>>;
+  expectedLexicographicSnapshotOrder: string[];
+  expectedNumericSnapshotOrder: string[];
+  expectedCanonicalOrder: string[];
+}
+
 const messageCompleted = (params: {
   threadId: string;
   id: string;
@@ -721,3 +732,137 @@ export const chronologyReplayFixtures: ChronologyReplayFixture[] = [
 export const chronologyReplayFixtureById = Object.fromEntries(
   chronologyReplayFixtures.map((fixture) => [fixture.id, fixture])
 ) as Record<string, ChronologyReplayFixture>;
+
+export const existingSessionChronologyFixture: ExistingSessionChronologyFixture = {
+  id: "existing-session-flat-snapshot-rollout-recovery",
+  description:
+    "A historical CLI session is reopened later from a lossy flat thread/read snapshot whose item-* ids are already lexicographically ordered and share one fallback timestamp.",
+  threadId: "thread-existing-session-flat-snapshot",
+  threadReadSnapshot: {
+    id: "thread-existing-session-flat-snapshot",
+    createdAt: "2026-01-10T16:01:40.000Z",
+    updatedAt: "2026-01-10T16:12:55.000Z",
+    messages: [
+      {
+        id: "item-1",
+        role: "user",
+        content:
+          "Set up a GitHub Action that emails me whenever tracked repositories receive new commits."
+      },
+      {
+        id: "item-10",
+        role: "assistant",
+        content:
+          "I found the workflow syntax issue and corrected the invalid trigger configuration."
+      },
+      {
+        id: "item-11",
+        role: "assistant",
+        content:
+          "The repository now sends email notifications for configured branches and includes setup notes."
+      },
+      {
+        id: "item-2",
+        role: "assistant",
+        content:
+          "I’m inspecting the empty repository first, then I’ll scaffold the workflow and config files."
+      },
+      {
+        id: "item-3",
+        role: "user",
+        content: "Track pushes on the main and release branches."
+      },
+      {
+        id: "item-4",
+        role: "assistant",
+        content:
+          "I added a tracked-repositories config file so the workflow knows which branches to watch."
+      }
+    ]
+  },
+  rolloutRecords: [
+    {
+      kind: "message",
+      id: "message-1",
+      role: "user",
+      content:
+        "Set up a GitHub Action that emails me whenever tracked repositories receive new commits.",
+      createdAt: "2026-01-10T15:06:13.810Z",
+      order: 0,
+      sourceType: "event_msg"
+    },
+    {
+      kind: "message",
+      id: "message-2",
+      role: "assistant",
+      content:
+        "I’m inspecting the empty repository first, then I’ll scaffold the workflow and config files.",
+      createdAt: "2026-01-10T15:06:40.237Z",
+      order: 1,
+      sourceType: "response_item"
+    },
+    {
+      kind: "message",
+      id: "message-3",
+      role: "user",
+      content: "Track pushes on the main and release branches.",
+      createdAt: "2026-01-10T15:07:01.905Z",
+      order: 2,
+      sourceType: "event_msg"
+    },
+    {
+      kind: "message",
+      id: "message-4",
+      role: "assistant",
+      content:
+        "I added a tracked-repositories config file so the workflow knows which branches to watch.",
+      createdAt: "2026-01-10T15:07:32.422Z",
+      order: 3,
+      sourceType: "response_item"
+    },
+    {
+      kind: "message",
+      id: "message-10",
+      role: "assistant",
+      content:
+        "I found the workflow syntax issue and corrected the invalid trigger configuration.",
+      createdAt: "2026-01-10T15:09:41.901Z",
+      order: 4,
+      sourceType: "response_item"
+    },
+    {
+      kind: "message",
+      id: "message-11",
+      role: "assistant",
+      content:
+        "The repository now sends email notifications for configured branches and includes setup notes.",
+      createdAt: "2026-01-10T15:10:18.044Z",
+      order: 5,
+      sourceType: "response_item"
+    }
+  ],
+  expectedLexicographicSnapshotOrder: [
+    "user:item-1",
+    "assistant:item-10",
+    "assistant:item-11",
+    "assistant:item-2",
+    "user:item-3",
+    "assistant:item-4"
+  ],
+  expectedNumericSnapshotOrder: [
+    "user:item-1",
+    "assistant:item-2",
+    "user:item-3",
+    "assistant:item-4",
+    "assistant:item-10",
+    "assistant:item-11"
+  ],
+  expectedCanonicalOrder: [
+    "user:message-1",
+    "assistant:message-2",
+    "user:message-3",
+    "assistant:message-4",
+    "assistant:message-10",
+    "assistant:message-11"
+  ]
+};

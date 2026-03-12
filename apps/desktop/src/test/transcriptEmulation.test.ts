@@ -6,6 +6,7 @@ import { __TEST_ONLY__ as codexApiTest } from "../services/codexApi";
 import type { ChatMessage } from "../domain/types";
 import {
   chronologyReplayFixtureById,
+  existingSessionChronologyFixture,
   type ExpectedToolBubble
 } from "./chronologyReplayFixtures";
 import {
@@ -1023,5 +1024,19 @@ describe("frontend transcript emulation", () => {
 
     expect(messageRoleIdOrder(messages)).toEqual(fixture.expectedOrder);
     expectToolBubblesToMatch(messages, fixture.expectedToolBubbles);
+  });
+
+  it("keeps reopened flat existing-session snapshots in numeric item order before rollout enrichment arrives", () => {
+    const snapshotMessages = codexApiTest.parseMessagesFromThread(
+      "device-1",
+      existingSessionChronologyFixture.threadId,
+      existingSessionChronologyFixture.threadReadSnapshot
+    );
+
+    const reopened = __TEST_ONLY__.mergeSnapshotMessages([], snapshotMessages);
+
+    expect(messageRoleIdOrder(reopened)).toEqual(
+      existingSessionChronologyFixture.expectedNumericSnapshotOrder
+    );
   });
 });

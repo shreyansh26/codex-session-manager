@@ -4,9 +4,11 @@ import type {
   ComposerPreference,
   ThreadTokenUsageState
 } from "../domain/types";
+import { __TEST_ONLY__ as codexApiTest } from "../services/codexApi";
 import { __TEST_ONLY__ } from "../state/useAppStore";
 import {
   chronologyReplayFixtureById,
+  existingSessionChronologyFixture,
   type ExpectedToolBubble
 } from "./chronologyReplayFixtures";
 import {
@@ -43,6 +45,17 @@ const expectToolBubblesToMatch = (
     }
   });
 };
+
+const rolloutMessagesFromExistingSessionFixture = (): ChatMessage[] =>
+  existingSessionChronologyFixture.rolloutRecords
+    .map((record) =>
+      codexApiTest.toTimelineMessageFromRolloutRecord(
+        "device-1",
+        existingSessionChronologyFixture.threadId,
+        record
+      )
+    )
+    .filter((message): message is ChatMessage => message !== null);
 
 describe("useAppStore message upsert behavior", () => {
   it("replaces optimistic user message when server acknowledgement arrives", () => {
@@ -723,6 +736,41 @@ describe("useAppStore message upsert behavior", () => {
       ["item-2", "2026-03-08T09:39:28.104Z"],
       ["call-live-tool", "2026-03-08T09:39:28.747Z"],
       ["item-3", "2026-03-08T09:39:40.754Z"]
+    ]);
+  });
+
+  it("replaces flat-fallback chronology anchors when authoritative rollout history arrives later", () => {
+    const snapshotMessages = codexApiTest.parseMessagesFromThread(
+      "device-1",
+      existingSessionChronologyFixture.threadId,
+      existingSessionChronologyFixture.threadReadSnapshot
+    );
+    const rolloutMessages = rolloutMessagesFromExistingSessionFixture();
+
+    const firstLoad = __TEST_ONLY__.mergeSnapshotMessages([], snapshotMessages);
+    const repaired = __TEST_ONLY__.mergeRolloutEnrichmentMessages(
+      firstLoad,
+      rolloutMessages
+    );
+
+    expect(messageRoleIdOrder(firstLoad)).toEqual(
+      existingSessionChronologyFixture.expectedNumericSnapshotOrder
+    );
+    expect(repaired.map((message) => `${message.role}:${message.id}`)).toEqual([
+      "user:item-1",
+      "assistant:item-2",
+      "user:item-3",
+      "assistant:item-4",
+      "assistant:item-10",
+      "assistant:item-11"
+    ]);
+    expect(repaired.map((message) => message.createdAt)).toEqual([
+      "2026-01-10T15:06:13.810Z",
+      "2026-01-10T15:06:40.237Z",
+      "2026-01-10T15:07:01.905Z",
+      "2026-01-10T15:07:32.422Z",
+      "2026-01-10T15:09:41.901Z",
+      "2026-01-10T15:10:18.044Z"
     ]);
   });
 

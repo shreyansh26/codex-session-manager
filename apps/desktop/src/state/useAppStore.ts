@@ -222,6 +222,7 @@ const mergeStoredMessage = (
   content: mergeMessageContent(current, incoming),
   createdAt: pickMergedTimestamp(current, incoming),
   timelineOrder: pickMergedTimelineOrder(current, incoming),
+  chronologySource: pickMergedChronologySource(current, incoming),
   toolCall: mergeToolCalls(current.toolCall, incoming.toolCall)
 });
 
@@ -348,7 +349,51 @@ const shouldPreserveEarliestUserTimestamp = (
   !incoming.toolCall;
 
 const isCompactedRolloutHistoryMessage = (message: ChatMessage): boolean =>
-  message.eventType !== "tool_call" && message.id.startsWith("message-");
+  message.eventType !== "tool_call" &&
+  (message.chronologySource === "rollout" || message.id.startsWith("message-"));
+
+const chronologyRank = (
+  source: ChatMessage["chronologySource"]
+): number => {
+  switch (source) {
+    case "rollout":
+      return 3;
+    case "turn":
+      return 2;
+    case "live":
+      return 1;
+    case "flat_fallback":
+      return 0;
+    default:
+      return -1;
+  }
+};
+
+const isAuthoritativeChronologySource = (
+  source: ChatMessage["chronologySource"]
+): boolean => source === "turn" || source === "rollout";
+
+const shouldPromoteIncomingChronology = (
+  current: ChatMessage,
+  incoming: ChatMessage
+): boolean =>
+  current.chronologySource === "flat_fallback" &&
+  isAuthoritativeChronologySource(incoming.chronologySource);
+
+const shouldPreserveCurrentChronology = (
+  current: ChatMessage,
+  incoming: ChatMessage
+): boolean =>
+  isAuthoritativeChronologySource(current.chronologySource) &&
+  incoming.chronologySource === "flat_fallback";
+
+const pickMergedChronologySource = (
+  current: ChatMessage,
+  incoming: ChatMessage
+): ChatMessage["chronologySource"] =>
+  chronologyRank(incoming.chronologySource) >= chronologyRank(current.chronologySource)
+    ? incoming.chronologySource ?? current.chronologySource
+    : current.chronologySource;
 
 const isRestampedHistoryTwinCandidate = (
   current: ChatMessage,
@@ -771,6 +816,12 @@ const pickMergedTimestamp = (
   current: ChatMessage,
   incoming: ChatMessage
 ): string => {
+  if (shouldPromoteIncomingChronology(current, incoming)) {
+    return incoming.createdAt;
+  }
+  if (shouldPreserveCurrentChronology(current, incoming)) {
+    return current.createdAt;
+  }
   if (shouldPreserveCurrentTimestamp(current, incoming)) {
     return current.createdAt;
   }
@@ -788,10 +839,17 @@ const pickMergedTimestamp = (
 const pickMergedTimelineOrder = (
   current: ChatMessage,
   incoming: ChatMessage
-): number | undefined =>
-  typeof current.timelineOrder === "number"
+): number | undefined => {
+  if (shouldPromoteIncomingChronology(current, incoming)) {
+    return incoming.timelineOrder ?? current.timelineOrder;
+  }
+  if (shouldPreserveCurrentChronology(current, incoming)) {
+    return current.timelineOrder ?? incoming.timelineOrder;
+  }
+  return typeof current.timelineOrder === "number"
     ? current.timelineOrder
     : incoming.timelineOrder;
+};
 
 const shouldPreserveCurrentTimestamp = (
   current: ChatMessage,
@@ -832,11 +890,12 @@ const preferCanonicalMessage = (
 ): ChatMessage => {
   const preserveTimelineOrder = (winner: ChatMessage): ChatMessage => ({
     ...winner,
-    ...(typeof current.timelineOrder === "number"
-      ? { timelineOrder: current.timelineOrder }
-      : typeof incoming.timelineOrder === "number"
-        ? { timelineOrder: incoming.timelineOrder }
-        : {})
+    ...(typeof pickMergedTimelineOrder(current, incoming) === "number"
+      ? { timelineOrder: pickMergedTimelineOrder(current, incoming) }
+      : {}),
+    ...(pickMergedChronologySource(current, incoming)
+      ? { chronologySource: pickMergedChronologySource(current, incoming) }
+      : {})
   });
   const currentReasoning = current.eventType === "reasoning";
   const incomingReasoning = incoming.eventType === "reasoning";
