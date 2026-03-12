@@ -373,11 +373,16 @@ const isAuthoritativeChronologySource = (
   source: ChatMessage["chronologySource"]
 ): boolean => source === "turn" || source === "rollout";
 
+const isLegacyChronologyAnchor = (message: ChatMessage): boolean =>
+  !message.chronologySource &&
+  typeof message.timelineOrder === "number" &&
+  !isOptimisticMessage(message);
+
 const shouldPromoteIncomingChronology = (
   current: ChatMessage,
   incoming: ChatMessage
 ): boolean =>
-  current.chronologySource === "flat_fallback" &&
+  (current.chronologySource === "flat_fallback" || isLegacyChronologyAnchor(current)) &&
   isAuthoritativeChronologySource(incoming.chronologySource);
 
 const shouldPreserveCurrentChronology = (
