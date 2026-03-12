@@ -1026,6 +1026,49 @@ describe("frontend transcript emulation", () => {
     expectToolBubblesToMatch(messages, fixture.expectedToolBubbles);
   });
 
+  it("replays a reopened CLI session from flat thread/read history into canonical rollout chronology", () => {
+    const snapshotMessages = codexApiTest.parseMessagesFromThread(
+      "device-1",
+      existingSessionChronologyFixture.threadId,
+      existingSessionChronologyFixture.threadReadSnapshot
+    );
+    const rolloutMessages = existingSessionChronologyFixture.rolloutRecords
+      .map((record) =>
+        codexApiTest.toTimelineMessageFromRolloutRecord(
+          "device-1",
+          existingSessionChronologyFixture.threadId,
+          record
+        )
+      )
+      .filter((message): message is ChatMessage => message !== null);
+
+    const reopened = __TEST_ONLY__.mergeSnapshotMessages([], snapshotMessages);
+    const repaired = __TEST_ONLY__.mergeRolloutEnrichmentMessages(
+      reopened,
+      rolloutMessages
+    );
+
+    expect(messageRoleIdOrder(repaired)).toEqual([
+      "user:item-1",
+      "assistant:item-2",
+      "user:item-3",
+      "assistant:item-4",
+      "assistant:item-10",
+      "assistant:item-11"
+    ]);
+    expect(repaired.map((message) => message.createdAt)).toEqual([
+      "2026-01-10T15:06:13.810Z",
+      "2026-01-10T15:06:40.237Z",
+      "2026-01-10T15:07:01.905Z",
+      "2026-01-10T15:07:32.422Z",
+      "2026-01-10T15:09:41.901Z",
+      "2026-01-10T15:10:18.044Z"
+    ]);
+    expect(messageRoleIdOrder(repaired)).not.toEqual(
+      existingSessionChronologyFixture.expectedLexicographicSnapshotOrder
+    );
+  });
+
   it("keeps reopened flat existing-session snapshots in numeric item order before rollout enrichment arrives", () => {
     const snapshotMessages = codexApiTest.parseMessagesFromThread(
       "device-1",
