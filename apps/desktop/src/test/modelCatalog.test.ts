@@ -27,8 +27,8 @@ describe("modelCatalog normalization", () => {
 });
 
 describe("modelCatalog effort defaults", () => {
-  it("defaults gpt-5.4 to xhigh effort", () => {
-    expect(resolveThinkingEffortForModel("gpt-5.4", undefined)).toBe("xhigh");
+  it("defaults gpt-5.4 to high effort", () => {
+    expect(resolveThinkingEffortForModel("gpt-5.4", undefined)).toBe("high");
   });
 
   it("defaults gpt-5.3-codex to xhigh effort", () => {

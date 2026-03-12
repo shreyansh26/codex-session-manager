@@ -52,13 +52,13 @@ const THINKING_EFFORT_LABELS: Record<ThinkingEffort, string> = {
 };
 
 const MODEL_DEFAULT_THINKING_EFFORT: Partial<Record<string, ThinkingEffort>> = {
-  "gpt-5.4": "xhigh",
+  "gpt-5.4": "high",
   "gpt-5.3-codex": "xhigh"
 };
 
 export const MODEL_CATALOG: readonly ModelCatalogEntry[] = MODEL_CATALOG_ENTRIES;
 
-export const DEFAULT_COMPOSER_MODEL_ID = "gpt-5.3-codex";
+export const DEFAULT_COMPOSER_MODEL_ID = "gpt-5.4";
 
 const DATE_SUFFIX_PATTERN = /-\d{4}-\d{2}-\d{2}$/;
 
