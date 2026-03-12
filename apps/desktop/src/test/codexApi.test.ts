@@ -10,7 +10,7 @@ import {
 } from "../services/codexApi";
 import type { ChatImageAttachment, ChatMessage, ComposerSubmission } from "../domain/types";
 import { parseRpcNotification } from "../services/eventParser";
-import { chronologyReplayFixtureById } from "../../../../../codex-app-electron/src/renderer/src/test/chronologyReplayFixtures";
+import { chronologyReplayFixtureById } from "./chronologyReplayFixtures";
 
 const sampleImage = (url: string): ChatImageAttachment => ({
   id: "img-1",

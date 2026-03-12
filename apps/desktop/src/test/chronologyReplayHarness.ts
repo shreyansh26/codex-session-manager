@@ -8,7 +8,7 @@ import { __TEST_ONLY__ as storeTest } from "../state/useAppStore";
 import type {
   ChronologyReplayFixture,
   ChronologyReplayStep
-} from "../../../../../codex-app-electron/src/renderer/src/test/chronologyReplayFixtures";
+} from "./chronologyReplayFixtures";
 
 const DEFAULT_DEVICE_ID = "device-1";
 

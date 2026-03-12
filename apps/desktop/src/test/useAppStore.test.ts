@@ -8,7 +8,7 @@ import { __TEST_ONLY__ } from "../state/useAppStore";
 import {
   chronologyReplayFixtureById,
   type ExpectedToolBubble
-} from "../../../../../codex-app-electron/src/renderer/src/test/chronologyReplayFixtures";
+} from "./chronologyReplayFixtures";
 import {
   applyChronologyReplayFixture,
   messageRoleIdOrder

@@ -7,7 +7,7 @@ import type { ChatMessage } from "../domain/types";
 import {
   chronologyReplayFixtureById,
   type ExpectedToolBubble
-} from "../../../../../codex-app-electron/src/renderer/src/test/chronologyReplayFixtures";
+} from "./chronologyReplayFixtures";
 import {
   applyChronologyReplayFixture,
   messageRoleIdOrder

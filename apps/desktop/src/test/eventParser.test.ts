@@ -6,7 +6,7 @@ import {
   parseThreadModelNotification,
   parseThreadTokenUsageNotification
 } from "../services/eventParser";
-import { chronologyReplayFixtureById } from "../../../../../codex-app-electron/src/renderer/src/test/chronologyReplayFixtures";
+import { chronologyReplayFixtureById } from "./chronologyReplayFixtures";
 
 const pickLiveNotification = (
   fixtureId: string,
