@@ -927,6 +927,81 @@ describe("useAppStore message upsert behavior", () => {
     );
   });
 
+  it("drops collapsed turn assistant history and reanchors turn users against rollout chronology", () => {
+    const merged = __TEST_ONLY__.mergeRolloutEnrichmentMessages(
+      [
+        buildMessage({
+          id: "item-user-1",
+          role: "user",
+          chronologySource: "turn",
+          timelineOrder: 0,
+          createdAt: "2026-03-12T14:15:49.000Z",
+          content: "Write the updated plan to plan_message_chronology_v3.md"
+        }),
+        buildMessage({
+          id: "item-assistant-2",
+          role: "assistant",
+          chronologySource: "turn",
+          timelineOrder: 1,
+          createdAt: "2026-03-12T14:15:49.000Z",
+          content: "Ledger Snapshot: Goal is to update plan_message_chronology_v3.md"
+        }),
+        buildMessage({
+          id: "item-assistant-3",
+          role: "assistant",
+          chronologySource: "turn",
+          timelineOrder: 2,
+          createdAt: "2026-03-12T14:15:49.000Z",
+          content: "The updated v3 plan is in place."
+        })
+      ],
+      [
+        buildMessage({
+          id: "message-live-1",
+          role: "assistant",
+          chronologySource: "rollout",
+          timelineOrder: 0,
+          createdAt: "2026-03-12T14:08:07.798Z",
+          content: "Ledger Snapshot: The reopened-session bug is not actually fixed."
+        }),
+        buildMessage({
+          id: "call-live-1",
+          role: "tool",
+          chronologySource: "rollout",
+          eventType: "tool_call",
+          timelineOrder: 1,
+          createdAt: "2026-03-12T14:08:08.687Z",
+          content: "Tool: exec_command",
+          toolCall: {
+            name: "exec_command",
+            input: "sed -n '1,220p' CONTINUITY.md",
+            status: "completed"
+          }
+        }),
+        buildMessage({
+          id: "message-live-2",
+          role: "assistant",
+          chronologySource: "rollout",
+          timelineOrder: 2,
+          createdAt: "2026-03-12T14:08:21.254Z",
+          content: "Ledger Snapshot: Historical reopen is still reconstructing the wrong transcript."
+        })
+      ]
+    );
+
+    expect(messageRoleIdOrder(merged)).toEqual([
+      "user:item-user-1",
+      "assistant:message-live-1",
+      "tool:call-live-1",
+      "assistant:message-live-2"
+    ]);
+    expect(merged.find((message) => message.id === "item-assistant-2")).toBeUndefined();
+    expect(merged.find((message) => message.id === "item-assistant-3")).toBeUndefined();
+    expect(merged.find((message) => message.id === "item-user-1")?.createdAt).toBe(
+      "2026-03-12T14:08:07.797Z"
+    );
+  });
+
   it("replays mixed live+snapshot+rollout convergence from the shared chronology corpus", () => {
     const fixture = chronologyReplayFixtureById["live-snapshot-rollout-tool-convergence"];
     const messages = applyChronologyReplayFixture(fixture);

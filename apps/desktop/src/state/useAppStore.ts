@@ -1113,8 +1113,8 @@ const mergeRolloutEnrichmentMessages = (
   enrichment: ChatMessage[]
 ): ChatMessage[] => {
   const normalizedEnrichment = normalizeSnapshotMessages(enrichment);
-  const normalizedExisting = stripSupersededTurnReasoning(
-    dedupeMessagesByIdentity(existing),
+  const normalizedExisting = stripCollapsedTurnHistoryShadow(
+    stripSupersededTurnReasoning(dedupeMessagesByIdentity(existing), normalizedEnrichment),
     normalizedEnrichment
   );
   const mergedByIdentity = new Map<string, ChatMessage>();
@@ -1197,6 +1197,44 @@ const stripSupersededTurnReasoning = (
   });
 };
 
+const findEarliestRolloutTimestampMs = (messages: ChatMessage[]): number | null => {
+  let earliest: number | null = null;
+  for (const message of messages) {
+    if (message.chronologySource !== "rollout") {
+      continue;
+    }
+    const timestampMs = Date.parse(message.createdAt);
+    if (!Number.isFinite(timestampMs)) {
+      continue;
+    }
+    earliest = earliest === null ? timestampMs : Math.min(earliest, timestampMs);
+  }
+  return earliest;
+};
+
+const stripCollapsedTurnHistoryShadow = (
+  existing: ChatMessage[],
+  enrichment: ChatMessage[]
+): ChatMessage[] => {
+  const earliestRolloutTimestampMs = findEarliestRolloutTimestampMs(enrichment);
+  if (earliestRolloutTimestampMs === null) {
+    return existing;
+  }
+
+  return existing.filter((message) => {
+    if (message.chronologySource !== "turn" || message.role === "user") {
+      return true;
+    }
+
+    const currentTimestampMs = Date.parse(message.createdAt);
+    if (!Number.isFinite(currentTimestampMs)) {
+      return true;
+    }
+
+    return currentTimestampMs < earliestRolloutTimestampMs;
+  });
+};
+
 const reanchorCollapsedTurnMessages = (messages: ChatMessage[]): ChatMessage[] => {
   const withTimeline = messages
     .filter(
@@ -1204,8 +1242,8 @@ const reanchorCollapsedTurnMessages = (messages: ChatMessage[]): ChatMessage[] =
         typeof message.timelineOrder === "number"
     )
     .sort((left, right) => left.timelineOrder - right.timelineOrder);
-  const earliestAuthoritative = withTimeline.find((message) =>
-    isAuthoritativeChronologySource(message.chronologySource)
+  const earliestRollout = withTimeline.find(
+    (message) => message.chronologySource === "rollout"
   );
 
   const restamped = new Map<string, string>();
@@ -1218,12 +1256,12 @@ const reanchorCollapsedTurnMessages = (messages: ChatMessage[]): ChatMessage[] =
       continue;
     }
 
-    if (!earliestAuthoritative) {
+    if (!earliestRollout) {
       continue;
     }
 
     const currentMs = Date.parse(message.createdAt);
-    const nextMs = Date.parse(earliestAuthoritative.createdAt);
+    const nextMs = Date.parse(earliestRollout.createdAt);
     if (!Number.isFinite(currentMs) || !Number.isFinite(nextMs) || currentMs < nextMs) {
       continue;
     }
