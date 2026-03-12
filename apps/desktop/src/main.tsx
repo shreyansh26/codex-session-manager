@@ -83,6 +83,27 @@ const waitForSessionAvailable = async (sessionKey: string): Promise<void> => {
   );
 };
 
+const resolveRequestedSessionKey = async (sessionSelector: string): Promise<string> => {
+  if (sessionSelector !== "__first__") {
+    await waitForSessionAvailable(sessionSelector);
+    return sessionSelector;
+  }
+
+  await waitForCondition(
+    () => {
+      const state = useAppStore.getState();
+      return state.sessions.length > 0 && !state.initializing;
+    },
+    "No sessions were available for __first__ transcript capture."
+  );
+
+  const sessionKey = useAppStore.getState().sessions[0]?.key;
+  if (!sessionKey) {
+    throw new Error("No sessions were available for __first__ transcript capture.");
+  }
+  return sessionKey;
+};
+
 const waitForThreadHydration = async (sessionKey: string): Promise<void> => {
   await waitForCondition(
     () => {
@@ -99,7 +120,8 @@ const waitForThreadHydration = async (sessionKey: string): Promise<void> => {
   );
 };
 
-const captureHistoricalSessionTranscript = async (sessionKey: string) => {
+const captureHistoricalSessionTranscript = async (sessionSelector: string) => {
+  const sessionKey = await resolveRequestedSessionKey(sessionSelector);
   await waitForSessionAvailable(sessionKey);
   const initialState = useAppStore.getState();
   const initialSession = initialState.sessions.find((session) => session.key === sessionKey);
