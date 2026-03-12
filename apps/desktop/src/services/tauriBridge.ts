@@ -15,6 +15,7 @@ const isTauriRuntime = (): boolean =>
 let demoDevices: DeviceRecord[] = [];
 const demoSearchSessions = new Map<string, SearchIndexThreadPayload>();
 let demoSearchLastUpdatedAtMs: number | undefined;
+const demoArtifacts = new Map<string, string>();
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
@@ -152,6 +153,12 @@ const mockInvoke = async <T>(
           : {})
       };
       return clone(status) as T;
+    }
+    case "debug_persist_artifact": {
+      const request = args.request as { fileName?: string; contents?: string };
+      const fileName = request.fileName?.trim() || "debug-artifact.json";
+      demoArtifacts.set(fileName, request.contents ?? "");
+      return `/tmp/codex-session-monitor-debug/${fileName}` as T;
     }
     default:
       throw new Error(`Unknown command in demo mode: ${command}`);
@@ -357,3 +364,15 @@ export const searchQuery = async (
 
 export const searchBootstrapStatus = async (): Promise<SearchBootstrapStatus> =>
   invoke("search_bootstrap_status");
+
+export const debugPersistArtifact = async (
+  fileName: string,
+  contents: string
+): Promise<string> => invoke("debug_persist_artifact", { request: { fileName, contents } });
+
+export const __TEST_ONLY__ = {
+  getDemoArtifact: (fileName: string): string | undefined => demoArtifacts.get(fileName),
+  clearDemoArtifacts: (): void => {
+    demoArtifacts.clear();
+  }
+};
