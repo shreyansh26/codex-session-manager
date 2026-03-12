@@ -927,7 +927,7 @@ describe("useAppStore message upsert behavior", () => {
     );
   });
 
-  it("drops collapsed turn assistant history without reanchoring users unless rollout user shadows are present", () => {
+  it("drops collapsed turn assistant history and reanchors turn users against rollout chronology", () => {
     const merged = __TEST_ONLY__.mergeRolloutEnrichmentMessages(
       [
         buildMessage({
@@ -990,44 +990,15 @@ describe("useAppStore message upsert behavior", () => {
     );
 
     expect(messageRoleIdOrder(merged)).toEqual([
+      "user:item-user-1",
       "assistant:message-live-1",
       "tool:call-live-1",
-      "assistant:message-live-2",
-      "user:item-user-1"
+      "assistant:message-live-2"
     ]);
     expect(merged.find((message) => message.id === "item-assistant-2")).toBeUndefined();
     expect(merged.find((message) => message.id === "item-assistant-3")).toBeUndefined();
     expect(merged.find((message) => message.id === "item-user-1")?.createdAt).toBe(
-      "2026-03-12T14:15:49.000Z"
-    );
-  });
-
-  it("does not reanchor live turn user messages when rollout user shadow is missing", () => {
-    const merged = __TEST_ONLY__.mergeRolloutEnrichmentMessages(
-      [
-        buildMessage({
-          id: "turn-user-current",
-          role: "user",
-          chronologySource: "turn",
-          timelineOrder: 0,
-          createdAt: "2026-03-12T14:15:49.000Z",
-          content: "Latest user prompt that should remain in place"
-        })
-      ],
-      [
-        buildMessage({
-          id: "rollout-assistant-only",
-          role: "assistant",
-          chronologySource: "rollout",
-          timelineOrder: 0,
-          createdAt: "2026-03-12T14:08:07.798Z",
-          content: "Recovered historical assistant context"
-        })
-      ]
-    );
-
-    expect(merged.find((message) => message.id === "turn-user-current")?.createdAt).toBe(
-      "2026-03-12T14:15:49.000Z"
+      "2026-03-12T14:08:07.797Z"
     );
   });
 
