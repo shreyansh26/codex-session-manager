@@ -10,6 +10,13 @@ import {
   resolveSupportedModelId,
   resolveThinkingEffortForModel
 } from "./domain/modelCatalog";
+import {
+  DEFAULT_SIDEBAR_WIDTH_PX,
+  clampSidebarWidth,
+  isValidShellWidth,
+  resolveCompactShell,
+  resolveCompactTransition
+} from "./shellLayout";
 import type {
   ChatMessage,
   SearchSessionHit,
@@ -20,8 +27,6 @@ import { shutdownRpcClients, useAppStore } from "./state/useAppStore";
 import { shallow } from "zustand/shallow";
 
 const REFRESH_INTERVAL_MS = 20_000;
-const SIDEBAR_MIN_WIDTH_PX = 280;
-const SIDEBAR_MAX_RATIO = 0.62;
 const SEARCH_DEBOUNCE_MS = 170;
 const EMPTY_MESSAGES: ChatMessage[] = [];
 const EMPTY_SEARCH_RESULTS: SearchSessionHit[] = [];
@@ -38,11 +43,6 @@ const SEARCH_IDLE_STATE = {
   searchHydratedCount: 0,
   searchHydrationTotal: 0,
   searchError: null as string | null
-};
-
-const clampSidebarWidth = (requested: number, shellWidth: number): number => {
-  const maxWidth = Math.max(SIDEBAR_MIN_WIDTH_PX, Math.floor(shellWidth * SIDEBAR_MAX_RATIO));
-  return Math.min(Math.max(requested, SIDEBAR_MIN_WIDTH_PX), maxWidth);
 };
 
 const pickThreadScopedValue = <T,>(
@@ -73,8 +73,12 @@ const pickThreadScopedValue = <T,>(
 export default function App() {
   const shellRef = useRef<HTMLDivElement | null>(null);
   const activePointerIdRef = useRef<number | null>(null);
-  const [sidebarWidth, setSidebarWidth] = useState(360);
+  const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH_PX);
+  const sidebarWidthRef = useRef(DEFAULT_SIDEBAR_WIDTH_PX);
   const [resizingSidebar, setResizingSidebar] = useState(false);
+  const resizingSidebarRef = useRef(false);
+  const [compactShell, setCompactShell] = useState(false);
+  const compactShellRef = useRef(false);
   const [composerFocusToken, setComposerFocusToken] = useState(0);
   const [searchQueryText, setSearchQueryText] = useState("");
   const [searchDeviceScope, setSearchDeviceScope] = useState("__all__");
@@ -166,6 +170,18 @@ export default function App() {
   const clearChatSearch = useAppStore((state) => state.clearChatSearch);
 
   useEffect(() => {
+    sidebarWidthRef.current = sidebarWidth;
+  }, [sidebarWidth]);
+
+  useEffect(() => {
+    resizingSidebarRef.current = resizingSidebar;
+  }, [resizingSidebar]);
+
+  useEffect(() => {
+    compactShellRef.current = compactShell;
+  }, [compactShell]);
+
+  useEffect(() => {
     void initialize();
     return () => {
       shutdownRpcClients();
@@ -183,9 +199,22 @@ export default function App() {
   }, [refreshSessions]);
 
   useEffect(() => {
-    if (!resizingSidebar) {
+    if (!resizingSidebar || compactShell) {
       return;
     }
+
+    const endResize = (pointerId: number | null): void => {
+      if (
+        pointerId !== null &&
+        activePointerIdRef.current !== null &&
+        pointerId !== activePointerIdRef.current
+      ) {
+        return;
+      }
+
+      activePointerIdRef.current = null;
+      setResizingSidebar(false);
+    };
 
     const onPointerMove = (event: PointerEvent): void => {
       if (activePointerIdRef.current !== null && event.pointerId !== activePointerIdRef.current) {
@@ -202,26 +231,99 @@ export default function App() {
     };
 
     const onPointerUp = (event: PointerEvent): void => {
-      if (activePointerIdRef.current !== null && event.pointerId !== activePointerIdRef.current) {
-        return;
-      }
+      endResize(event.pointerId);
+    };
 
-      activePointerIdRef.current = null;
-      setResizingSidebar(false);
+    const onPointerCancel = (event: PointerEvent): void => {
+      endResize(event.pointerId);
+    };
+
+    const onWindowBlur = (): void => {
+      endResize(null);
     };
 
     document.body.style.userSelect = "none";
     document.body.style.cursor = "col-resize";
     window.addEventListener("pointermove", onPointerMove);
     window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerCancel);
+    window.addEventListener("blur", onWindowBlur);
 
     return () => {
       document.body.style.userSelect = "";
       document.body.style.cursor = "";
       window.removeEventListener("pointermove", onPointerMove);
       window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerCancel);
+      window.removeEventListener("blur", onWindowBlur);
     };
-  }, [resizingSidebar]);
+  }, [resizingSidebar, compactShell]);
+
+  useEffect(() => {
+    const shell = shellRef.current;
+    if (!shell) {
+      return;
+    }
+
+    const applyMeasurement = (shellWidth: number): void => {
+      const previousCompact = compactShellRef.current;
+      const effectiveSidebarWidth = clampSidebarWidth(
+        sidebarWidthRef.current,
+        shellWidth
+      );
+      if (effectiveSidebarWidth !== sidebarWidthRef.current) {
+        sidebarWidthRef.current = effectiveSidebarWidth;
+        setSidebarWidth(effectiveSidebarWidth);
+      }
+
+      const nextCompact = resolveCompactShell({
+        shellWidth,
+        effectiveSidebarWidth,
+        wasCompact: previousCompact
+      });
+      const transition = resolveCompactTransition({
+        wasCompact: previousCompact,
+        nextCompact,
+        isResizing: resizingSidebarRef.current,
+        activePointerId: activePointerIdRef.current
+      });
+
+      if (transition.clearActivePointer) {
+        activePointerIdRef.current = null;
+      }
+      if (transition.clearResizing) {
+        resizingSidebarRef.current = false;
+        setResizingSidebar(false);
+        document.body.style.userSelect = "";
+        document.body.style.cursor = "";
+      }
+
+      if (nextCompact !== previousCompact) {
+        compactShellRef.current = nextCompact;
+        setCompactShell(nextCompact);
+      }
+    };
+
+    const measureShell = (): void => {
+      const nextWidth = shell.getBoundingClientRect().width;
+      if (!isValidShellWidth(nextWidth)) {
+        applyMeasurement(Number.NaN);
+        return;
+      }
+      applyMeasurement(nextWidth);
+    };
+
+    const observer = new ResizeObserver(() => {
+      measureShell();
+    });
+
+    observer.observe(shell);
+    measureShell();
+
+    return () => {
+      observer.disconnect();
+    };
+  }, []);
 
   useEffect(() => {
     const trimmedQuery = searchQueryText.trim();
@@ -326,9 +428,18 @@ export default function App() {
       });
   };
 
+  const sidebarPaneStyle = compactShell ? undefined : { width: `${sidebarWidth}px` };
+  const shellClassName = [
+    "app-shell",
+    resizingSidebar ? "app-shell--resizing" : "",
+    compactShell ? "app-shell--compact" : ""
+  ]
+    .filter((entry) => entry.length > 0)
+    .join(" ");
+
   return (
-    <div className={`app-shell ${resizingSidebar ? "app-shell--resizing" : ""}`} ref={shellRef}>
-      <div className="app-shell__sidebar-pane" style={{ width: `${sidebarWidth}px` }}>
+    <div className={shellClassName} ref={shellRef}>
+      <div className="app-shell__sidebar-pane" style={sidebarPaneStyle}>
         <Sidebar
           devices={devices}
           sessions={sessions}
@@ -370,7 +481,7 @@ export default function App() {
         aria-orientation="vertical"
         className="app-shell__splitter"
         onPointerDown={(event) => {
-          if (window.matchMedia("(max-width: 980px)").matches) {
+          if (compactShell) {
             return;
           }
           event.preventDefault();

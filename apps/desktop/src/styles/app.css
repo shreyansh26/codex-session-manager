@@ -4,6 +4,7 @@
   padding: 1rem;
   min-width: 0;
   min-height: 0;
+  overflow: hidden;
 }
 
 .sidebar,
@@ -44,7 +45,8 @@
   width: 100%;
   min-width: 0;
   max-width: none;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .workspace {
@@ -115,7 +117,8 @@
 }
 
 .sidebar__groups {
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   padding: 0.75rem;
 }
 
@@ -502,7 +505,8 @@
 .workspace__search-results {
   border-bottom: 1px solid color-mix(in srgb, var(--line) 90%, transparent);
   padding: 0.55rem 1rem 0.8rem;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   max-height: min(45dvh, 420px);
 }
 
@@ -605,7 +609,8 @@
 
 .chat-panel {
   padding: 1rem;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   min-height: 0;
 }
 
@@ -1041,50 +1046,102 @@
 }
 
 @media (max-width: 980px) {
-  .app-shell {
-    display: grid;
-    grid-template-columns: 1fr;
-    grid-template-rows: minmax(260px, 48dvh) 1fr;
-    padding: 0.7rem;
-    gap: 0.7rem;
-  }
-
-  .sidebar,
-  .workspace {
-    min-height: 0;
-  }
-
-  .app-shell__sidebar-pane {
-    width: auto !important;
-    min-width: 0;
-    max-width: none;
-  }
-
-  .app-shell__splitter {
-    display: none;
-  }
-
-  .sidebar__device-actions {
-    flex-wrap: wrap;
-  }
-
-  .sidebar__new-session-path-row {
-    grid-template-columns: 1fr;
-  }
-
-  .workspace__search {
-    grid-template-columns: 1fr;
-  }
-
-  .workspace__topbar {
-    flex-wrap: wrap;
-  }
-
-  .workspace__search-results {
+  .app-shell--compact .workspace__search-results {
     max-height: 34dvh;
   }
+}
 
-  .workspace__search-group-header {
-    flex-wrap: wrap;
-  }
+.app-shell--compact {
+  display: grid;
+  grid-template-columns: 1fr;
+  grid-template-rows: minmax(260px, 48dvh) 1fr;
+  padding: 0.7rem;
+  gap: 0.7rem;
+}
+
+.app-shell--compact .sidebar,
+.app-shell--compact .workspace {
+  min-height: 0;
+}
+
+.app-shell--compact .app-shell__sidebar-pane {
+  width: auto !important;
+  min-width: 0;
+  max-width: none;
+}
+
+.app-shell--compact .app-shell__splitter {
+  display: none;
+}
+
+.app-shell--compact .sidebar__device-actions {
+  flex-wrap: wrap;
+}
+
+.app-shell--compact .sidebar__new-session-path-row {
+  grid-template-columns: 1fr;
+}
+
+.app-shell--compact .workspace__topbar {
+  flex-wrap: wrap;
+}
+
+.app-shell--compact .workspace__search {
+  grid-template-columns: 1fr;
+}
+
+.app-shell--compact .workspace__search-group-header {
+  flex-wrap: wrap;
+}
+
+.app-shell--compact .workspace__search-group-header span {
+  white-space: normal;
+}
+
+.app-shell--compact .chat-panel__header {
+  flex-wrap: wrap;
+}
+
+.app-shell--compact .chat-panel__history-controls {
+  flex-wrap: wrap;
+}
+
+.app-shell--compact .chat-panel__history-meta {
+  width: 100%;
+}
+
+.app-shell--compact .bubble__tool-header {
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+.app-shell--compact .bubble__tool-status {
+  white-space: normal;
+}
+
+.app-shell--compact .composer__selectors {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.app-shell--compact .composer__selector select {
+  width: 100%;
+  min-width: 0;
+}
+
+.app-shell--compact .composer__actions {
+  flex-wrap: wrap;
+}
+
+.app-shell--compact .composer__attachment {
+  grid-template-columns: 48px minmax(0, 1fr);
+}
+
+.app-shell--compact .composer__attachment-remove {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+
+.app-shell--compact .workspace__search-session-meta {
+  overflow-wrap: anywhere;
 }
