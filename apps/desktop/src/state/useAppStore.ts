@@ -1112,13 +1112,16 @@ const mergeRolloutEnrichmentMessages = (
   existing: ChatMessage[],
   enrichment: ChatMessage[]
 ): ChatMessage[] => {
-  const normalizedExisting = dedupeMessagesByIdentity(existing);
+  const normalizedEnrichment = normalizeSnapshotMessages(enrichment);
+  const normalizedExisting = stripSupersededTurnReasoning(
+    dedupeMessagesByIdentity(existing),
+    normalizedEnrichment
+  );
   const mergedByIdentity = new Map<string, ChatMessage>();
   for (const message of normalizedExisting) {
     mergedByIdentity.set(messageIdentityKey(message), message);
   }
 
-  const normalizedEnrichment = normalizeSnapshotMessages(enrichment);
   const enrichmentChatOrdinals = buildServerChatOrdinalLookup(normalizedEnrichment);
 
   for (const message of normalizedEnrichment) {
@@ -1159,7 +1162,90 @@ const mergeRolloutEnrichmentMessages = (
     );
   }
 
-  return dedupeEquivalentServerMessages([...mergedByIdentity.values()]);
+  return reanchorCollapsedTurnMessages(
+    dedupeEquivalentServerMessages([...mergedByIdentity.values()])
+  ).sort(sortMessagesAscending);
+};
+
+const stripSupersededTurnReasoning = (
+  existing: ChatMessage[],
+  enrichment: ChatMessage[]
+): ChatMessage[] => {
+  const rolloutReasoning = enrichment.filter(
+    (message) =>
+      message.chronologySource === "rollout" && message.eventType === "reasoning"
+  );
+  if (rolloutReasoning.length === 0) {
+    return existing;
+  }
+
+  return existing.filter((message) => {
+    if (message.chronologySource !== "turn" || message.eventType !== "reasoning") {
+      return true;
+    }
+
+    const currentText = normalizeMessageText(message.content).toLowerCase();
+    return !rolloutReasoning.some((candidate) => {
+      const candidateText = normalizeMessageText(candidate.content).toLowerCase();
+      return (
+        candidateText.length > 0 &&
+        (currentText === candidateText ||
+          currentText.includes(candidateText) ||
+          candidateText.includes(currentText))
+      );
+    });
+  });
+};
+
+const reanchorCollapsedTurnMessages = (messages: ChatMessage[]): ChatMessage[] => {
+  const withTimeline = messages
+    .filter(
+      (message): message is ChatMessage & { timelineOrder: number } =>
+        typeof message.timelineOrder === "number"
+    )
+    .sort((left, right) => left.timelineOrder - right.timelineOrder);
+  const earliestAuthoritative = withTimeline.find((message) =>
+    isAuthoritativeChronologySource(message.chronologySource)
+  );
+
+  const restamped = new Map<string, string>();
+  for (const message of withTimeline) {
+    if (
+      message.chronologySource !== "turn" ||
+      message.eventType === "reasoning" ||
+      message.role !== "user"
+    ) {
+      continue;
+    }
+
+    if (!earliestAuthoritative) {
+      continue;
+    }
+
+    const currentMs = Date.parse(message.createdAt);
+    const nextMs = Date.parse(earliestAuthoritative.createdAt);
+    if (!Number.isFinite(currentMs) || !Number.isFinite(nextMs) || currentMs < nextMs) {
+      continue;
+    }
+
+    restamped.set(
+      messageIdentityKey(message),
+      new Date(Math.max(0, nextMs - 1)).toISOString()
+    );
+  }
+
+  if (restamped.size === 0) {
+    return messages;
+  }
+
+  return messages.map((message) =>
+    restamped.has(messageIdentityKey(message))
+      ? {
+          ...message,
+          createdAt: restamped.get(messageIdentityKey(message)) ?? message.createdAt
+        }
+      : message
+  );
 };
 
 const sameThreadHydrationState = (
