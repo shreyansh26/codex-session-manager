@@ -1245,6 +1245,12 @@ const reanchorCollapsedTurnMessages = (messages: ChatMessage[]): ChatMessage[] =
   const earliestRollout = withTimeline.find(
     (message) => message.chronologySource === "rollout"
   );
+  const rolloutUserCandidates = withTimeline.filter(
+    (message) =>
+      message.chronologySource === "rollout" &&
+      message.role === "user" &&
+      message.eventType !== "reasoning"
+  );
 
   const restamped = new Map<string, string>();
   for (const message of withTimeline) {
@@ -1257,6 +1263,13 @@ const reanchorCollapsedTurnMessages = (messages: ChatMessage[]): ChatMessage[] =
     }
 
     if (!earliestRollout) {
+      continue;
+    }
+
+    const hasCollapsedShadowTwin = rolloutUserCandidates.some((candidate) =>
+      isRestampedHistoryTwinCandidate(message, candidate)
+    );
+    if (!hasCollapsedShadowTwin) {
       continue;
     }
 

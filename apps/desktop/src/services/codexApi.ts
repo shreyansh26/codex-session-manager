@@ -623,7 +623,15 @@ const recoverRolloutHistoryForThread = async (
     };
   }
 
-  const recoveredPath = await findLatestRolloutPath(device, threadId);
+  let recoveredPath: string | null = null;
+  try {
+    recoveredPath = await findLatestRolloutPath(device, threadId);
+  } catch {
+    return {
+      rolloutPath: normalizedPreferredPath,
+      messages: initialMessages
+    };
+  }
   const normalizedRecoveredPath = recoveredPath?.trim() || null;
   if (!normalizedRecoveredPath) {
     return {

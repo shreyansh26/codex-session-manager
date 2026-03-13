@@ -201,7 +201,6 @@ export const historicalReopenRolloutRepairExpectedBrokenOrder = [
 ];
 
 export const historicalReopenRolloutRepairExpectedFixedOrder = [
-  "user:item-29",
   "assistant:message-verify-openai-summary",
   "assistant:message-item-31-rollout",
   "user:item-32",
@@ -210,5 +209,6 @@ export const historicalReopenRolloutRepairExpectedFixedOrder = [
   "assistant:message-update-default-model",
   "tool:call-update-script-model",
   "tool:call-update-readme-model",
+  "user:item-29",
   "assistant:message-item-34-rollout"
 ];
