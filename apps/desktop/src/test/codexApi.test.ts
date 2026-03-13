@@ -490,4 +490,34 @@ describe("parseMessagesFromThread", () => {
       existingSessionChronologyFixture.expectedCanonicalOrder
     );
   });
+
+  it("returns initial rollout state when rollout-path recovery probe throws", async () => {
+    const recovered = await codexApiTest.recoverRolloutHistoryForThread(
+      {
+        id: "mock-local-device",
+        name: "Local Device",
+        config: { kind: "local" },
+        connected: true,
+        connection: {
+          endpoint: "mock://local/mock-local-device",
+          transport: "mock-jsonrpc",
+          connectedAtMs: Date.UTC(2026, 2, 12, 9, 30, 0, 0)
+        }
+      },
+      "thread-recovery-fallback",
+      "/preferred/rollout.jsonl",
+      "2026-03-12T14:00:00.000Z",
+      {
+        readRolloutMessages: async () => [],
+        findLatestRolloutPath: async () => {
+          throw new Error("command/exec unavailable");
+        }
+      }
+    );
+
+    expect(recovered).toEqual({
+      rolloutPath: "/preferred/rollout.jsonl",
+      messages: []
+    });
+  });
 });
