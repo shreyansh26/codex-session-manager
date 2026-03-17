@@ -3,9 +3,14 @@ import ReactDOM from "react-dom/client";
 import { flushSync } from "react-dom";
 import App from "./App";
 import {
+  findLatestRolloutPathForThread,
+  readRolloutTimelineMessages
+} from "./services/codexApi";
+import {
   captureTranscriptPhase,
   findMountedChatPanelRoot
 } from "./services/reopenedSessionTranscriptCapture";
+import { enrichReopenedSessionTranscriptCapture } from "./services/renderedTranscriptSnapshot";
 import { debugPersistArtifact } from "./services/tauriBridge";
 import { useAppStore } from "./state/useAppStore";
 import "./styles/globals.css";
@@ -104,7 +109,10 @@ const resolveRequestedSessionKey = async (sessionSelector: string): Promise<stri
   return sessionKey;
 };
 
-const waitForThreadHydration = async (sessionKey: string): Promise<void> => {
+const waitForThreadHydration = async (
+  sessionKey: string,
+  timeoutMs = 10_000
+): Promise<void> => {
   await waitForCondition(
     () => {
       const state = useAppStore.getState();
@@ -116,7 +124,8 @@ const waitForThreadHydration = async (sessionKey: string): Promise<void> => {
         !hydration?.toolHistoryLoading
       );
     },
-    `Thread hydration did not settle for ${sessionKey}.`
+    `Thread hydration did not settle for ${sessionKey}.`,
+    timeoutMs
   );
 };
 
@@ -138,7 +147,7 @@ const captureHistoricalSessionTranscript = async (sessionSelector: string) => {
     preserveSummary: true,
     hydrateRollout: false
   });
-  await waitForThreadHydration(sessionKey);
+  await waitForThreadHydration(sessionKey, 30_000);
 
   const baseState = useAppStore.getState();
   const baseSession = baseState.sessions.find((session) => session.key === sessionKey);
@@ -163,11 +172,41 @@ const captureHistoricalSessionTranscript = async (sessionSelector: string) => {
     costDisplay: EMPTY_COST_DISPLAY
   });
 
+  const baseDevice =
+    baseState.devices.find((device) => device.id === baseSession.deviceId) ??
+    initialState.devices.find((device) => device.id === initialSession.deviceId);
+  let rolloutParsedCapture: Awaited<ReturnType<typeof captureTranscriptPhase>> | null = null;
+
+  if (baseDevice) {
+    const rolloutPath = await findLatestRolloutPathForThread(
+      baseDevice,
+      baseSession.threadId
+    );
+    if (typeof rolloutPath === "string" && rolloutPath.trim().length > 0) {
+      const rolloutParsedMessages = await readRolloutTimelineMessages(
+        baseDevice,
+        baseSession.threadId,
+        rolloutPath,
+        baseSession.updatedAt
+      );
+      rolloutParsedCapture = await captureTranscriptPhase({
+        session: baseSession,
+        messages: rolloutParsedMessages,
+        hydrationState: {
+          ...baseHydration,
+          toolHistoryLoading: true
+        },
+        phase: "rollout-parsed",
+        costDisplay: EMPTY_COST_DISPLAY
+      });
+    }
+  }
+
   await useAppStore.getState().refreshThread(initialSession.deviceId, initialSession.threadId, {
     preserveSummary: true,
     hydrateRollout: true
   });
-  await waitForThreadHydration(sessionKey);
+  await waitForThreadHydration(sessionKey, 30_000);
 
   const rolloutState = useAppStore.getState();
   const rolloutSession = rolloutState.sessions.find((session) => session.key === sessionKey);
@@ -180,24 +219,28 @@ const captureHistoricalSessionTranscript = async (sessionSelector: string) => {
     };
   const rolloutRoot = findMountedChatPanelRoot();
   if (!rolloutSession || !rolloutRoot) {
-    throw new Error(`Rollout-idle transcript capture failed for ${sessionKey}.`);
+    throw new Error(`Rollout-applied transcript capture failed for ${sessionKey}.`);
   }
 
   const rolloutCapture = await captureTranscriptPhase({
     session: rolloutSession,
     messages: rolloutMessages,
     hydrationState: rolloutHydration,
-    phase: "rollout-idle",
+    phase: "rollout-applied",
     mountedRoot: rolloutRoot,
     costDisplay: EMPTY_COST_DISPLAY
   });
 
-  return {
+  return enrichReopenedSessionTranscriptCapture({
     sessionKey,
     threadId: rolloutSession.threadId,
     deviceId: rolloutSession.deviceId,
-    captures: [baseCapture, rolloutCapture]
-  };
+    captures: [
+      baseCapture,
+      ...(rolloutParsedCapture ? [rolloutParsedCapture] : []),
+      rolloutCapture
+    ]
+  });
 };
 
 const buildDefaultCaptureFileName = (sessionKey: string): string =>
