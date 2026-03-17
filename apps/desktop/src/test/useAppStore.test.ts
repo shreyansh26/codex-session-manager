@@ -15,7 +15,10 @@ import {
   historicalReopenRolloutRepairBaseMessages,
   historicalReopenRolloutRepairExpectedBrokenOrder,
   historicalReopenRolloutRepairExpectedFixedOrder,
-  historicalReopenRolloutRepairRolloutMessages
+  historicalReopenRolloutRepairRolloutMessages,
+  postHydrationParseLossBaseMessages,
+  postHydrationParseLossExpectedCanonicalOrder,
+  postHydrationParseLossRolloutAppliedMessages
 } from "./reopenedSessionDiagnosticFixtures";
 import {
   applyChronologyReplayFixture,
@@ -911,6 +914,17 @@ describe("useAppStore message upsert behavior", () => {
       existingSessionChronologyFixture.expectedNumericSnapshotOrder
     );
     expect(repaired.map((message) => message.timelineOrder)).toEqual([0, 1, 2, 3, 4, 5]);
+  });
+
+  it("keeps base-loaded user/tool/assistant interleaving when rollout-applied coverage is lossy", () => {
+    const repaired = __TEST_ONLY__.mergeRolloutEnrichmentMessages(
+      postHydrationParseLossBaseMessages,
+      postHydrationParseLossRolloutAppliedMessages
+    );
+
+    expect(messageRoleIdOrder(repaired)).toEqual(
+      postHydrationParseLossExpectedCanonicalOrder
+    );
   });
 
   it("drops superseded turn reasoning blocks when rollout chronology repairs a reopened historical session", () => {

@@ -314,7 +314,7 @@ export const postHydrationParseLossRolloutAppliedMessages: ChatMessage[] = [
     timelineOrder: 2,
     createdAt: "2026-03-17T17:03:10.000Z",
     content:
-      "Next I'm freezing failing regressions before changing the parser or merge path."
+      "Next I’m freezing failing regressions before changing the parser or merge path."
   })
 ];
 
@@ -358,7 +358,7 @@ export const responseItemClassifierFixture = {
       id: "response-item-assistant",
       role: "assistant",
       content:
-        "I'm adding failing-first regressions now so the parser change is forced by tests.",
+        "I’m adding failing-first regressions now so the parser change is forced by tests.",
       createdAt: "2026-03-17T17:02:50.000Z",
       order: 2,
       sourceType: "response_item"
@@ -408,7 +408,7 @@ export const longSessionRolloutTruncationFixture = (() => {
               id: "critical-assistant",
               role: "assistant",
               content:
-                "Captured. I'm preserving this interleaving in the regression fixture."
+                "Captured. I’m preserving this interleaving in the regression fixture."
             }
           ]
         }
