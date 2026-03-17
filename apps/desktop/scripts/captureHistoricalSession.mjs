@@ -40,7 +40,26 @@ const timeout = setTimeout(() => {
   child.kill("SIGTERM");
   console.error(`Timed out waiting for transcript capture at ${tempArtifactPath}`);
   process.exit(1);
-}, 120_000);
+}, 180_000);
+
+const finalizeCapture = (contents) => {
+  let parsed = null;
+  try {
+    parsed = JSON.parse(contents);
+  } catch {
+    parsed = null;
+  }
+
+  if (parsed && typeof parsed === "object" && parsed.error === true) {
+    console.error(`Capture failed: ${parsed.message ?? "unknown error"}`);
+    process.exit(1);
+  }
+
+  mkdirSync(dirname(outputPath), { recursive: true });
+  writeFileSync(outputPath, contents);
+  console.log(`Captured reopened-session transcript artifact at ${outputPath}`);
+  process.exit(0);
+};
 
 const poll = setInterval(() => {
   if (!existsSync(tempArtifactPath)) {
@@ -51,20 +70,14 @@ const poll = setInterval(() => {
   clearInterval(poll);
   clearTimeout(timeout);
   child.kill("SIGTERM");
-  mkdirSync(dirname(outputPath), { recursive: true });
-  writeFileSync(outputPath, contents);
-  console.log(`Captured reopened-session transcript artifact at ${outputPath}`);
-  process.exit(0);
+  finalizeCapture(contents);
 }, 500);
 
 child.on("exit", (code) => {
   clearInterval(poll);
   clearTimeout(timeout);
   if (existsSync(tempArtifactPath)) {
-    mkdirSync(dirname(outputPath), { recursive: true });
-    writeFileSync(outputPath, readFileSync(tempArtifactPath, "utf8"));
-    console.log(`Captured reopened-session transcript artifact at ${outputPath}`);
-    process.exit(0);
+    finalizeCapture(readFileSync(tempArtifactPath, "utf8"));
   }
   process.exit(code ?? 1);
 });
