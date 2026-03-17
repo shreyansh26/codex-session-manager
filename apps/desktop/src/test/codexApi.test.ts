@@ -14,6 +14,7 @@ import {
   chronologyReplayFixtureById,
   existingSessionChronologyFixture
 } from "./chronologyReplayFixtures";
+import { responseItemClassifierFixture } from "./reopenedSessionDiagnosticFixtures";
 
 const sampleImage = (url: string): ChatImageAttachment => ({
   id: "img-1",
@@ -488,6 +489,20 @@ describe("parseMessagesFromThread", () => {
     expect(recovered.rolloutPath).toContain(existingSessionChronologyFixture.threadId);
     expect(openedMessages.map((message) => `${message.role}:${message.id}`)).toEqual(
       existingSessionChronologyFixture.expectedCanonicalOrder
+    );
+  });
+
+  it("filters hidden response_item wrappers but keeps visible response_item user prompts", () => {
+    const messages = responseItemClassifierFixture.rolloutTimeline
+      .map((record) =>
+        codexApiTest.toTimelineMessageFromRolloutRecord("device-1", "thread-1", {
+          ...record
+        })
+      )
+      .filter((message): message is ChatMessage => message !== null);
+
+    expect(messages.map((message) => `${message.role}:${message.id}`)).toEqual(
+      responseItemClassifierFixture.expectedVisibleRoleIdOrder
     );
   });
 });
