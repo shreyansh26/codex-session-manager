@@ -329,6 +329,36 @@ const toolCallSignature = (message: ChatMessage): string =>
     message.toolCall?.status ?? ""
   ].join("|");
 
+const hasCompatibleToolCallShadow = (
+  message: ChatMessage,
+  candidate: ChatMessage
+): boolean => {
+  const messageOutput = message.toolCall?.output?.trim() ?? "";
+  const candidateOutput = candidate.toolCall?.output?.trim() ?? "";
+
+  if (
+    messageOutput.length > 0 &&
+    candidateOutput.length > 0 &&
+    !candidateOutput.includes(messageOutput)
+  ) {
+    return false;
+  }
+
+  const messageStatus = message.toolCall?.status ?? "";
+  const candidateStatus = candidate.toolCall?.status ?? "";
+
+  if (
+    messageStatus.length > 0 &&
+    candidateStatus.length > 0 &&
+    messageStatus !== candidateStatus &&
+    !(messageStatus === "running" && candidateStatus === "completed")
+  ) {
+    return false;
+  }
+
+  return true;
+};
+
 const messageIdentityKey = (message: ChatMessage): string =>
   [
     message.id,
@@ -1113,8 +1143,9 @@ const mergeRolloutEnrichmentMessages = (
   enrichment: ChatMessage[]
 ): ChatMessage[] => {
   const normalizedEnrichment = normalizeSnapshotMessages(enrichment);
+  const dedupedExisting = dedupeMessagesByIdentity(existing);
   const normalizedExisting = stripCollapsedTurnHistoryShadow(
-    stripSupersededTurnReasoning(dedupeMessagesByIdentity(existing), normalizedEnrichment),
+    stripSupersededTurnReasoning(dedupedExisting, normalizedEnrichment),
     normalizedEnrichment
   );
   const mergedByIdentity = new Map<string, ChatMessage>();
@@ -1162,9 +1193,15 @@ const mergeRolloutEnrichmentMessages = (
     );
   }
 
-  return reanchorCollapsedTurnMessages(
+  const merged = reanchorCollapsedTurnMessages(
     dedupeEquivalentServerMessages([...mergedByIdentity.values()])
   ).sort(sortMessagesAscending);
+
+  if (shouldKeepBaseSnapshotDuringLossyRollout(dedupedExisting, normalizedEnrichment, merged)) {
+    return dedupeEquivalentServerMessages(dedupedExisting).sort(sortMessagesAscending);
+  }
+
+  return merged;
 };
 
 const stripSupersededTurnReasoning = (
@@ -1221,6 +1258,21 @@ const stripCollapsedTurnHistoryShadow = (
     return existing;
   }
 
+  const hasRolloutShadowReplacement = (
+    message: ChatMessage,
+    candidate: ChatMessage
+  ): boolean => {
+    if (message.eventType === "tool_call" && candidate.eventType === "tool_call") {
+      return (
+        message.role === candidate.role &&
+        imageSignature(message) === imageSignature(candidate) &&
+        message.toolCall?.name?.trim() === candidate.toolCall?.name?.trim() &&
+        message.toolCall?.input?.trim() === candidate.toolCall?.input?.trim() &&
+        hasCompatibleToolCallShadow(message, candidate)
+      );
+    }
+    return isEquivalentServerMessage(message, candidate);
+  };
   return existing.filter((message) => {
     if (message.chronologySource !== "turn" || message.role === "user") {
       return true;
@@ -1231,8 +1283,99 @@ const stripCollapsedTurnHistoryShadow = (
       return true;
     }
 
+    if (message.role === "assistant" && !message.eventType) {
+      return currentTimestampMs < earliestRolloutTimestampMs;
+    }
+
+    const hasRolloutReplacement = enrichment.some(
+      (candidate) =>
+        candidate.chronologySource === "rollout" &&
+        candidate.role !== "user" &&
+        hasRolloutShadowReplacement(message, candidate)
+    );
+
+    const isCollapsedTurnShadow = isCollapsedTurnShadowMessage(message, existing);
+    if (!hasRolloutReplacement && !isCollapsedTurnShadow) {
+      return true;
+    }
     return currentTimestampMs < earliestRolloutTimestampMs;
   });
+};
+
+const isCollapsedTurnShadowMessage = (
+  message: ChatMessage,
+  messages: ChatMessage[]
+): boolean => {
+  if (message.chronologySource !== "turn" || message.role === "user") {
+    return false;
+  }
+
+  return (
+    messages.filter(
+      (entry) =>
+        entry.chronologySource === "turn" &&
+        entry.role !== "user" &&
+        entry.createdAt === message.createdAt
+    ).length >= 2
+  );
+};
+
+const countUserToolMessages = (messages: ChatMessage[]): { user: number; tool: number } => ({
+  user: messages.filter((message) => message.role === "user").length,
+  tool: messages.filter((message) => message.eventType === "tool_call").length
+});
+
+const shouldKeepBaseSnapshotDuringLossyRollout = (
+  existing: ChatMessage[],
+  enrichment: ChatMessage[],
+  merged: ChatMessage[]
+): boolean => {
+  if (enrichment.length === 0) {
+    return false;
+  }
+
+  const orderedExisting = [...existing].sort(sortMessagesAscending);
+  const earliestEnrichmentTimestampMs = findEarliestRolloutTimestampMs(enrichment);
+  const overlapExisting =
+    earliestEnrichmentTimestampMs === null
+      ? orderedExisting
+      : orderedExisting.filter((message) => {
+          const timestampMs = Date.parse(message.createdAt);
+          return Number.isFinite(timestampMs) && timestampMs >= earliestEnrichmentTimestampMs;
+        });
+  const comparisonExisting =
+    overlapExisting.length > 0
+      ? overlapExisting
+      : orderedExisting.slice(-Math.max(8, enrichment.length));
+
+  if (comparisonExisting.length === 0) {
+    return false;
+  }
+
+  const existingCoverage = countUserToolMessages(comparisonExisting);
+  const enrichmentCoverage = countUserToolMessages(enrichment);
+  if (existingCoverage.tool > 0 && enrichmentCoverage.tool === 0) {
+    return true;
+  }
+
+  const latestBaseMessage = comparisonExisting.at(-1);
+  if (!latestBaseMessage) {
+    return false;
+  }
+
+  if (latestBaseMessage.eventType === "tool_call") {
+    return false;
+  }
+
+  if (!isAuthoritativeChronologySource(latestBaseMessage.chronologySource)) {
+    return false;
+  }
+
+  if (isCollapsedTurnShadowMessage(latestBaseMessage, comparisonExisting)) {
+    return false;
+  }
+
+  return !hasMatchingMessage(merged, latestBaseMessage);
 };
 
 const reanchorCollapsedTurnMessages = (messages: ChatMessage[]): ChatMessage[] => {
@@ -1276,14 +1419,10 @@ const reanchorCollapsedTurnMessages = (messages: ChatMessage[]): ChatMessage[] =
     return messages;
   }
 
-  return messages.map((message) =>
-    restamped.has(messageIdentityKey(message))
-      ? {
-          ...message,
-          createdAt: restamped.get(messageIdentityKey(message)) ?? message.createdAt
-        }
-      : message
-  );
+  return messages.map((message) => {
+    const createdAt = restamped.get(messageIdentityKey(message));
+    return createdAt ? { ...message, createdAt } : message;
+  });
 };
 
 const sameThreadHydrationState = (
